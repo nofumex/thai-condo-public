@@ -27,7 +27,7 @@ from .collections import (WINDOWS, COLLECTION_SCAN_PAGES, COLLECTION_MAX_PAGES, 
 from .geography import CITIES, AREAS, AREAS_BY_ID, district_of, city_of
 from .fx import FX
 from .pricing import public_text,retail_price
-from .channel import parse_start,publish_cycle
+from .channel import parse_start,publish_cycle,publish_manual,CHANNEL_TEST_MAX
 from .render import (MAIN,main_kb,filter_kb,filter_summary,choices_kb,payment_filter_text,payment_filter_kb,card_text,card_kb,
                      details_text,detail_kb,kb,b,link,esc,money)
 log=logging.getLogger(__name__)
@@ -138,6 +138,8 @@ class Application:
         st=await self.db.channel_stats()
         err=await self.db.get_config('channel_last_error')
         checked=await self.db.get_config('channel_last_check')
+        cycle=await self.db.get_config('channel_last_cycle_stats',{}) or {}
+        manual=await self.db.get_config('channel_manual_progress',{}) or {}
         self.panel_kind[uid]='channel'
         txt=('<b>📢 Канал · '+esc(self.cfg.channel_chat)+'</b>\n\n'
              f'Публикация: <b>{"включена" if enabled else "выключена"}</b>\n'
@@ -145,13 +147,26 @@ class Application:
              f'Фильтры: {esc(concise(f))}\n'
              f'Опубликовано: {st["posts"]} · переходов: {st["clicks"]} '
              f'({st["users"]} уник.)\n\n'
-             '<i>После включения публикуются только новые объявления. Старые посты не рассылаются.</i>'
-             +(f'\n\n⚠️ Последняя ошибка: {esc(err)}' if err else '')
-             +(f'\n🕓 Проверено: {esc(str(checked)[:16])}' if checked else ''))
+             '<i>При первом включении фиксируется исходная выборка без рассылки. '
+             'Далее публикуются впервые обнаруженные ID, без дублей.</i>')
+        if cycle:
+            status='Базовая выборка сохранена' if cycle.get('status')=='baseline' else 'Проверка завершена'
+            if cycle.get('status')=='error':status='Ошибка проверки'
+            if cycle.get('status')=='posting':status='Публикация выполняется'
+            txt+=(f'\n\n<b>🔎 {status}</b>'
+                  f'\nПросмотрено: {cycle.get("scanned_rows",0)} объявл. / {cycle.get("scanned_pages",0)} стр.'
+                  f'\nНовых ID: {cycle.get("new",0)} · опубликовано: {cycle.get("posted",0)}'
+                  f' · очередь: {cycle.get("pending",0)}')
+        if manual:
+            txt+=(f'\n\n🧪 Ручная отправка: {manual.get("posted",0)}/{manual.get("requested",0)}'
+                  +(' · выполняется' if manual.get('status')=='running' else ' · завершена' if manual.get('status')=='done' else ' · ошибка'))
+        if err:txt+='\n\n⚠️ Последняя ошибка: '+esc(err)
+        if checked:txt+='\n🕓 Проверено: '+esc(str(checked)[:16])
         await self.panel(uid,chat,txt,kb([
             [b(('⏸ Выключить' if enabled else '▶️ Включить'),'admin:channel_toggle')],
             [b('🎯 Фильтры публикаций','admin:channel_filters')],
             [b('⏱ Интервал','admin:channel_interval'),b('🔄 Проверить сейчас','admin:channel_check')],
+            [b('🧪 Отправить тестовые объявления','admin:channel_manual')],
             [b('← Админка','go:admin')]]))
 
     async def channel_cycle(self):
@@ -164,8 +179,31 @@ class Application:
                 return count
             except Exception as exc:
                 await self.db.set_config('channel_last_error',str(exc)[:350])
+                current=await self.db.get_config('channel_last_cycle_stats',{}) or {}
+                await self.db.set_config('channel_last_cycle_stats',dict(
+                    current,status='error',pending=await self.db.channel_pending_count(),
+                    error=str(exc)[:350]))
                 log.exception('Channel posting failed: %s',exc)
                 return 0
+
+    async def channel_manual_job(self,uid,chat,count):
+        if self.channel_lock.locked():
+            await self.bot.send_message(chat,'⏳ Идёт другая проверка или отправка в канал. Повторите позже.')
+            return
+        async with self.channel_lock:
+            try:
+                result=await publish_manual(self,count)
+                await self.bot.send_message(chat,
+                    f'✅ Отправлено: <b>{result["posted"]}/{count}</b>\n'
+                    f'Уже опубликованы: {result["already_posted"]} · '
+                    f'проверено: {result["inspected"]} объявлений.',parse_mode='HTML')
+            except Exception as exc:
+                log.exception('Manual channel posting failed')
+                await self.db.set_config('channel_manual_progress',{
+                    'status':'error','requested':count,
+                    'posted':(await self.db.get_config('channel_manual_progress',{})).get('posted',0)})
+                await self.db.set_config('channel_last_error',str(exc)[:350])
+                await self.bot.send_message(chat,'⚠️ Ручная отправка остановилась: '+esc(str(exc)[:320]),parse_mode='HTML')
 
     async def channel_loop(self):
         # Short heartbeat: configuration changes take effect without restarting.
@@ -408,8 +446,8 @@ class Application:
             changed=clean(f)!=previous
             if changed:
                 await self.db.set_config('channel_filters',clean(f))
-                # Never retro-post historic ads when an admin changes the filter.
-                await self.db.set_config('channel_watermark',datetime.now(timezone.utc).isoformat())
+                # First full scan with changed filters becomes a no-backfill baseline.
+                await self.db.set_config('channel_baseline_signature',None)
             return changed
         changed=await self.db.save_filters(uid,kind,f)
         if changed and kind=='latest':
@@ -1084,6 +1122,18 @@ class Application:
                         await self.channel_panel(uid,m.chat.id)
                     except ValueError:
                         await self.bot.send_message(m.chat.id,'⚠️ Интервал: от 1 до 1440 минут.')
+                elif field=='channel_manual':
+                    try:
+                        count=int(raw)
+                        if not 1<=count<=CHANNEL_TEST_MAX:raise ValueError()
+                    except ValueError:
+                        await self.bot.send_message(m.chat.id,
+                            f'⚠️ Введите целое число от 1 до {CHANNEL_TEST_MAX}.')
+                    else:
+                        self.task(self.channel_manual_job(uid,m.chat.id,count))
+                        await self.bot.send_message(m.chat.id,
+                            f'🧪 Начинаю отправку до {count} объявлений по фильтрам канала. '
+                            'Дубли будут пропущены. Проверить прогресс можно в админке.')
                 elif field=='user_lookup':
                     await self.admin_user_panel(uid,m.chat.id,raw)
                 return
@@ -1208,11 +1258,13 @@ class Application:
             elif action=='sync':
                 self.task(self.sync_once(3))
                 await self.bot.send_message(q.message.chat.id,'🔄 Обновление индекса запущено в фоне.')
-            elif action in ('markup','users','channel_interval'):
+            elif action in ('markup','users','channel_interval','channel_manual'):
                 prompts={
                     'markup':'Введите наценку в THB (целое число, от 0 до 1000000). 0 — отключить.',
                     'users':'Введите Telegram ID или username пользователя (@username).',
-                    'channel_interval':'Введите период проверки новых объявлений в минутах (1–1440).'}
+                    'channel_interval':'Введите период проверки новых объявлений в минутах (1–1440).',
+                    'channel_manual':f'Сколько тестовых объявлений отправить в канал? (1–{CHANNEL_TEST_MAX}). '
+                        'Публикуются первые подходящие по выбранной сортировке; уже размещённые будут пропущены.'}
                 m=await self.bot.send_message(q.message.chat.id,'✍️ '+prompts[action])
                 self.admin_pending[q.from_user.id]=('user_lookup' if action=='users' else action,m.message_id)
                 return
@@ -1224,7 +1276,8 @@ class Application:
                 enabled=await self.db.get_config('channel_enabled',False)
                 await self.db.set_config('channel_enabled',not enabled)
                 if not enabled:
-                    await self.db.set_config('channel_watermark',datetime.now(timezone.utc).isoformat())
+                    # Re-enable starts with a snapshot, not an old-listing flood.
+                    await self.db.set_config('channel_baseline_signature',None)
                 await self.channel_panel(q.from_user.id,q.message.chat.id);return
             elif action=='channel_check':
                 self.task(self.channel_cycle())
@@ -1237,6 +1290,9 @@ class Application:
     async def run(self):
         await self.db.init()
         self.retail_markup=max(0,int(await self.db.get_config('retail_markup_thb',0)))
+        old_manual=await self.db.get_config('channel_manual_progress',{}) or {}
+        if old_manual.get('status')=='running':
+            await self.db.set_config('channel_manual_progress',dict(old_manual,status='interrupted'))
         self.task(self.background_sync());self.task(self.fx.loop())
         self.task(self.collection_maintenance())
         self.task(self.channel_loop())

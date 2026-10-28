@@ -58,6 +58,15 @@ class Database:
           created_at TEXT NOT NULL, source_created_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_channel_posts_date ON channel_posts(created_at DESC);
+        CREATE TABLE IF NOT EXISTS channel_seen (
+          listing_id TEXT PRIMARY KEY,
+          first_seen TEXT NOT NULL,
+          last_seen TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('baseline','pending','published')),
+          listing_json TEXT NOT NULL,
+          sort_order INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_channel_seen_status ON channel_seen(status,first_seen);
         CREATE TABLE IF NOT EXISTS referral_visits (
           id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
           listing_id TEXT NOT NULL, route TEXT NOT NULL,
@@ -358,6 +367,44 @@ class Database:
         await self.conn.execute('UPDATE users SET details=details+1 WHERE id=?',(uid,))
         await self.conn.execute('INSERT INTO detail_views(user_id,listing_id,viewed_at) VALUES(?,?,?)',
                                 (uid,str(listing_id),utc()))
+        await self.conn.commit()
+
+    async def channel_record_seen(self,items,baseline=False):
+        """Durable first-seen inventory; never overwrite pending with baseline."""
+        fresh=0
+        now=utc()
+        for ordinal,item in enumerate(items):
+            ident=str(item.get('id') or '')
+            if not ident.isascii() or not ident.isdigit():continue
+            data=json.dumps(item,ensure_ascii=False,default=str)
+            c=await self.conn.execute('''INSERT OR IGNORE INTO channel_seen
+                (listing_id,first_seen,last_seen,status,listing_json,sort_order)
+                VALUES(?,?,?,?,?,?)''',
+                (ident,now,now,'baseline' if baseline else 'pending',data,ordinal))
+            fresh+=max(0,c.rowcount) if not baseline else 0
+            await self.conn.execute('''UPDATE channel_seen
+                SET last_seen=?,listing_json=? WHERE listing_id=?''',(now,data,ident))
+        await self.conn.commit()
+        return fresh
+
+    async def channel_ignore_pending(self):
+        """An admin changing filters must not publish backlog from old filters."""
+        await self.conn.execute("UPDATE channel_seen SET status='baseline' WHERE status='pending'")
+        await self.conn.commit()
+
+    async def channel_pending(self,limit):
+        rows=await self._all('''SELECT listing_json FROM channel_seen
+            WHERE status='pending' ORDER BY first_seen ASC,sort_order ASC,listing_id ASC LIMIT ?''',(int(limit),))
+        return [json.loads(row['listing_json']) for row in rows]
+
+    async def channel_pending_count(self):
+        row=await self._one("SELECT COUNT(*) AS n FROM channel_seen WHERE status='pending'")
+        return int(row['n'])
+
+    async def channel_mark_published(self,ident):
+        # Manual publication can precede auto-discovery. Its ID must still be
+        # excluded from automatic duplicates.
+        await self.conn.execute("UPDATE channel_seen SET status='published' WHERE listing_id=?",(str(ident),))
         await self.conn.commit()
 
     async def channel_post_exists(self,listing_id):

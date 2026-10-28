@@ -103,6 +103,9 @@ def card_text(x,favorite=False,score=None,rate=None,markup=0,contact_label="Ар
     district=district_label(x)
     if district:lines.append(f'📍 <b>{esc(district)}</b>')
     if p.get('address'):lines.append('🗺 '+esc(public_text(p['address'])))
+    # Include update date in both the preview and the channel post.
+    refreshed=pretty_date(x.get('updatedAt') or x.get('refreshedAt'))
+    if refreshed:lines.append('🔄 Обновлено: '+refreshed)
     lines.append('')
     if price is not None:
         public_price=retail_price(price,markup)

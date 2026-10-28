@@ -1,12 +1,13 @@
 """Offline regression coverage for retail publication and acquisition attribution."""
 import unittest
+import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock,patch
 from datetime import datetime, timezone, timedelta
 from phbot.pricing import payment_amount,public_text
 import test_ui  # provides aiogram UI stubs if aiogram is absent
 from phbot.render import card_text,details_text,card_kb,detail_kb,filter_kb
-from phbot.channel import deep_link,parse_start,channel_caption,publish_cycle
+from phbot.channel import deep_link,parse_start,channel_caption,publish_cycle,publish_manual,channel_signature,discovery_orders
 from phbot.filters import clean
 
 
@@ -14,7 +15,7 @@ def sample(listing_id=6522838,created=None):
     created=created or datetime.now(timezone.utc).isoformat()
     return {
         'id':str(listing_id), 'slug':'sample-condo', 'title':'Nice condo',
-        'createdAt':created,'coverPicture':'/pictures/a.jpg',
+        'createdAt':created,'refreshedAt':created,'coverPicture':'/pictures/a.jpg',
         'price':{'forRent':{'monthly':{'price':13000}}},
         'priceLandAndHouse':{'forRent':{
             'deposit':{'type':'MONTH','month':2},
@@ -69,37 +70,187 @@ class DeepLinkTests(unittest.TestCase):
         self.assertIn('14 000',message)
         self.assertIn('start=home_6522838',message)
         self.assertIn('БОЛЬШЕ КВАРТИР',message)
+        self.assertIn('🔄 Обновлено:',message)
         self.assertNotIn('propertyhub.in.th',message.lower())
         self.assertNotIn('0891234567',message)
         self.assertLessEqual(len(message),1024)
 
+class FakeDB:
+    def __init__(self, settings=None):
+        self.settings=dict(settings or {'channel_enabled':True,'channel_filters':{},'retail_markup_thb':1000})
+        self.seen={}
+        self.posts={}
+        self.listings={}
+        self.config_updates=[]
+
+    async def get_config(self,key,default=None):return self.settings.get(key,default)
+    async def set_config(self,key,value):
+        self.settings[key]=value
+        self.config_updates.append((key,value))
+    async def put_listings(self,rows):
+        for row in rows:self.listings[str(row['id'])]=row
+    async def channel_record_seen(self,rows,baseline=False):
+        new=0
+        for row in rows:
+            ident=str(row['id'])
+            if ident not in self.seen:
+                self.seen[ident]=['baseline' if baseline else 'pending',row]
+                if not baseline:new+=1
+            else:self.seen[ident][1]=row
+        return new
+    async def channel_ignore_pending(self):
+        for value in self.seen.values():
+            if value[0]=='pending':value[0]='baseline'
+    async def channel_pending(self,limit):
+        return [value[1] for key,value in sorted(self.seen.items())
+                if value[0]=='pending'][:limit]
+    async def channel_pending_count(self):
+        return sum(1 for value in self.seen.values() if value[0]=='pending')
+    async def channel_post_exists(self,ident):return str(ident) in self.posts
+    async def save_channel_post(self,ident,chat,message_id,created):
+        self.posts[str(ident)]=(chat,message_id,created)
+    async def channel_mark_published(self,ident):
+        if str(ident) in self.seen:self.seen[str(ident)][0]='published'
+
+
+class FakeBot:
+    def __init__(self):self.photos=[];self.texts=[]
+    async def get_me(self):return SimpleNamespace(username='thai_condo1_bot')
+    async def send_photo(self,*args,**kwargs):
+        self.photos.append((args,kwargs))
+        return SimpleNamespace(message_id=len(self.photos))
+    async def send_message(self,*args,**kwargs):
+        self.texts.append((args,kwargs))
+        return SimpleNamespace(message_id=100+len(self.texts))
+
+
+def fake_app(rows=None,settings=None):
+    db=FakeDB(settings)
+    bot=FakeBot()
+    app=SimpleNamespace(db=db,bot=bot,cfg=SimpleNamespace(
+         channel_chat='@thai_condo',contact_label='Связь @nofumez'),
+         fx=SimpleNamespace(rate=None),
+         _search_page=AsyncMock(return_value=(rows or [],{'totalPages':1})))
+    return app
+
+
 class ChannelCycleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_publishes_new_only_once_and_records_posts(self):
+    async def test_initial_baseline_then_newly_seen_old_listing_publishes_once(self):
         now=datetime.now(timezone.utc)
-        fresh=sample(11,(now-timedelta(minutes=1)).isoformat())
-        old=sample(12,(now-timedelta(hours=2)).isoformat())
-        settings={'channel_enabled':True,'channel_filters':{},'channel_watermark':(now-timedelta(minutes=20)).isoformat(),'retail_markup_thb':1000}
-        seen=set();stored=[]
-        class DB:
-            async def get_config(self,key,default=None):return settings.get(key,default)
-            async def set_config(self,key,value):settings[key]=value
-            async def channel_post_exists(self,key):return key in seen
-            async def save_channel_post(self,key,*args):seen.add(key);stored.append((key,args))
-        class Bot:
-            def __init__(self):self.photos=[]
-            async def get_me(self):return SimpleNamespace(username='thai_condo1_bot')
-            async def send_photo(self,*args,**kwargs):
-                self.photos.append((args,kwargs))
-                return SimpleNamespace(message_id=101)
-        bot=Bot()
-        app=SimpleNamespace(db=DB(),bot=bot,cfg=SimpleNamespace(channel_chat='@thai_condo',contact_label='Связь @nofumez'),fx=SimpleNamespace(rate=None),
-                            _search_page=AsyncMock(return_value=([fresh,old],{'totalPages':1})))
-        self.assertEqual(await publish_cycle(app),1)
-        self.assertEqual(stored[0][0],'11')
-        self.assertEqual(len(bot.photos),1)
-        self.assertEqual(bot.photos[0][1]['reply_markup'].inline_keyboard[0][0].url,
-                         'https://t.me/thai_condo1_bot?start=11')
+        historic=sample(11,(now-timedelta(days=10)).isoformat())
+        app=fake_app([historic])
         self.assertEqual(await publish_cycle(app),0)
-        self.assertEqual(len(bot.photos),1)
+        self.assertEqual(len(app.bot.photos),0)
+        self.assertEqual(app.db.seen['11'][0],'baseline')
+        self.assertEqual(app.db.settings['channel_last_cycle_stats']['status'],'baseline')
+        # New to the monitored results, though its createdAt predates activation.
+        newly_visible=sample(12,(now-timedelta(days=100)).isoformat())
+        app._search_page.return_value=([newly_visible,historic],{'totalPages':1})
+        self.assertEqual(await publish_cycle(app),1)
+        self.assertEqual(set(app.db.posts),{'12'})
+        self.assertIn('12',app.db.listings)  # deep links require catalog data
+        self.assertEqual(app.bot.photos[0][1]['reply_markup'].inline_keyboard[0][0].url,
+                         'https://t.me/thai_condo1_bot?start=12')
+        self.assertEqual(await publish_cycle(app),0)
+        self.assertEqual(len(app.bot.photos),1)
+        self.assertEqual(app.db.settings['channel_last_cycle_stats']['new'],0)
+
+    async def test_selected_refresh_order_has_created_and_refreshed_overlap(self):
+        self.assertEqual(discovery_orders({'sort':'REFRESHED_AT'}),['REFRESHED_AT','CREATED_AT'])
+        self.assertEqual(discovery_orders({'sort':'PRICE_MONTHLY_LOW_TO_HIGH'}),
+                         ['PRICE_MONTHLY_LOW_TO_HIGH','CREATED_AT','REFRESHED_AT'])
+        app=fake_app([sample(1)],{'channel_enabled':True,'channel_filters':{'sort':'REFRESHED_AT'}})
+        self.assertEqual(await publish_cycle(app),0)
+        orders=[call.args[0]['sort'] for call in app._search_page.call_args_list]
+        self.assertEqual(orders,['REFRESHED_AT','CREATED_AT'])
+
+    async def test_filter_change_resets_baseline(self):
+        app=fake_app([sample(1)])
+        await publish_cycle(app)
+        app.db.settings['channel_filters']={'price_min':9000}
+        app._search_page.return_value=([sample(2)],{'totalPages':1})
+        self.assertEqual(await publish_cycle(app),0)
+        self.assertNotIn('2',app.db.posts)
+        app._search_page.return_value=([sample(2),sample(3)],{'totalPages':1})
+        self.assertEqual(await publish_cycle(app),1)
+        self.assertIn('3',app.db.posts)
+
+    @patch('phbot.channel.CHANNEL_POST_DELAY',0)
+    async def test_manual_fifty_posts_skips_already_published_and_respects_sort(self):
+        app=fake_app([sample(i) for i in range(1,61)],
+                     {'channel_enabled':False,'channel_filters':{'sort':'REFRESHED_AT'},'retail_markup_thb':500})
+        app.db.posts['1']=('channel',1,'old')
+        app.db.posts['2']=('channel',2,'old')
+        result=await publish_manual(app,50)
+        self.assertEqual(result['posted'],50)
+        self.assertEqual(result['already_posted'],2)
+        self.assertEqual(len(app.bot.photos),50)
+        self.assertEqual(app.db.settings['channel_manual_progress']['status'],'done')
+        self.assertEqual(app._search_page.call_args_list[0].args[0]['sort'],'REFRESHED_AT')
+        self.assertEqual(set(app.db.posts),{str(i) for i in range(1,53)})
+        result=await publish_manual(app,2)
+        self.assertEqual(result['posted'],2)
+        self.assertEqual(result['already_posted'],52)
+        self.assertEqual(len(app.bot.photos),52)
+
+    async def test_incomplete_scan_does_not_advance_baseline_or_checkpoint(self):
+        app=fake_app([sample(1)])
+        async def fail_second(filters,page,cache_minutes):
+            if page==2:raise RuntimeError('provider timed out')
+            return [sample(1)],{'totalPages':2}
+        app._search_page.side_effect=fail_second
+        with self.assertRaisesRegex(RuntimeError,'provider timed out'):
+            await publish_cycle(app)
+        self.assertFalse(app.db.seen)
+        self.assertNotIn('channel_baseline_signature',app.db.settings)
+        self.assertNotIn('channel_scan_checkpoint',app.db.settings)
+
+    async def test_signature_changes_when_order_changes(self):
+        self.assertNotEqual(channel_signature({'sort':'CREATED_AT'}),
+                            channel_signature({'sort':'REFRESHED_AT'}))
+
+    async def test_manual_bounds(self):
+        app=fake_app()
+        with self.assertRaises(ValueError):await publish_manual(app,0)
+        with self.assertRaises(ValueError):await publish_manual(app,101)
+
+    async def test_changed_filters_during_scan_are_not_published(self):
+        app=fake_app([sample(1)])
+        await publish_cycle(app)
+        async def change_filters(filters,page,cache_minutes):
+            app.db.settings['channel_filters']={'price_min':12500}
+            return [sample(2)],{'totalPages':1}
+        app._search_page.side_effect=change_filters
+        self.assertEqual(await publish_cycle(app),0)
+        self.assertNotIn('2',app.db.seen)
+        self.assertFalse(app.db.posts)
+
+    async def test_manual_post_is_not_republished_automatically(self):
+        app=fake_app([sample(1)])
+        await publish_cycle(app)  # baseline
+        app._search_page.return_value=([sample(2)],{'totalPages':1})
+        manual=await publish_manual(app,1)
+        self.assertEqual(manual['posted'],1)
+        self.assertEqual(await publish_cycle(app),0)
+        self.assertEqual(len(app.bot.photos),1)
+
+    async def test_channel_schema_ddl_valid(self):
+        import ast,sqlite3
+        from pathlib import Path
+        tree=ast.parse((Path(__file__).resolve().parent.parent/'phbot'/'db.py').read_text(encoding='utf8'))
+        schema=None
+        for node in ast.walk(tree):
+            if isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute) and node.func.attr=='executescript':
+                if node.args and isinstance(node.args[0],ast.Constant):schema=node.args[0].value
+        self.assertIsNotNone(schema)
+        connection=sqlite3.connect(':memory:')
+        try:
+            connection.executescript(schema)
+            connection.execute('''INSERT INTO channel_seen
+                (listing_id,first_seen,last_seen,status,listing_json,sort_order)
+                VALUES('42','2026-10-28','2026-10-28','pending','{}',1)''')
+            self.assertEqual(connection.execute('''SELECT status FROM channel_seen
+                WHERE listing_id='42' ''').fetchone()[0],'pending')
+        finally:connection.close()
 
 if __name__=='__main__':unittest.main()
