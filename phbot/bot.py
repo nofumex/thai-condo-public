@@ -8,7 +8,6 @@ import json
 import logging
 from dataclasses import dataclass,field
 from datetime import datetime,timezone,timedelta
-from html import escape
 from statistics import mean
 from math import isfinite
 from collections import defaultdict
@@ -19,14 +18,14 @@ from aiogram.types import Message,CallbackQuery,InputMediaPhoto
 from aiogram.exceptions import TelegramBadRequest,TelegramForbiddenError
 from .config import Config
 from .db import Database
-from .propertyhub import PropertyHub,ProviderError,image_url,price_of,plain_html
+from .propertyhub import PropertyHub,ProviderError,image_url,price_of
 from .filters import DEFAULT,AMENITIES,FACILITIES,ROOM_TYPES,SORTS,clean,concise,matches_local,attributes
 from .ranking import score,comparables,age_days
 from .collections import (WINDOWS, COLLECTION_SCAN_PAGES, COLLECTION_MAX_PAGES, COLLECTION_PAGE_BATCH,
                           COLLECTION_TARGET, signature, cache_expired, build_buckets)
 from .geography import CITIES, AREAS, AREAS_BY_ID, district_of, city_of
 from .fx import FX
-from .pricing import public_text,retail_price
+from .pricing import retail_price
 from .channel import parse_start,publish_cycle,publish_manual,CHANNEL_TEST_MAX
 from .render import (MAIN,main_kb,filter_kb,filter_summary,choices_kb,payment_filter_text,payment_filter_kb,card_text,card_kb,
                      details_text,detail_kb,kb,b,link,esc,money)
@@ -186,24 +185,42 @@ class Application:
                 log.exception('Channel posting failed: %s',exc)
                 return 0
 
-    async def channel_manual_job(self,uid,chat,count):
-        if self.channel_lock.locked():
-            await self.bot.send_message(chat,'⏳ Идёт другая проверка или отправка в канал. Повторите позже.')
-            return
-        async with self.channel_lock:
-            try:
-                result=await publish_manual(self,count)
-                await self.bot.send_message(chat,
-                    f'✅ Отправлено: <b>{result["posted"]}/{count}</b>\n'
-                    f'Уже опубликованы: {result["already_posted"]} · '
-                    f'проверено: {result["inspected"]} объявлений.',parse_mode='HTML')
-            except Exception as exc:
-                log.exception('Manual channel posting failed')
-                await self.db.set_config('channel_manual_progress',{
-                    'status':'error','requested':count,
-                    'posted':(await self.db.get_config('channel_manual_progress',{})).get('posted',0)})
-                await self.db.set_config('channel_last_error',str(exc)[:350])
-                await self.bot.send_message(chat,'⚠️ Ручная отправка остановилась: '+esc(str(exc)[:320]),parse_mode='HTML')
+    async def channel_manual_job(self,uid,chat,count,progress_id=None):
+        """One temporary admin message: edit its result and remove it after 5s.
+
+        Do not create a second permanent success/error message in the chat.
+        Result details remain available in the channel panel / SQLite.
+        """
+        message_text=None
+        try:
+            if self.channel_lock.locked():
+                message_text='⏳ Идёт другая проверка или отправка в канал. Повторите позже.'
+            else:
+                async with self.channel_lock:
+                    try:
+                        result=await publish_manual(self,count)
+                        message_text=(f'✅ Отправлено: <b>{result["posted"]}/{count}</b>\n'
+                                      f'Уже опубликованы: {result["already_posted"]} · '
+                                      f'проверено: {result["inspected"]} объявлений.')
+                    except Exception as exc:
+                        log.exception('Manual channel posting failed')
+                        progress=await self.db.get_config('channel_manual_progress',{}) or {}
+                        await self.db.set_config('channel_manual_progress',{
+                            'status':'error','requested':count,
+                            'posted':progress.get('posted',0)})
+                        await self.db.set_config('channel_last_error',str(exc)[:350])
+                        message_text='⚠️ Ручная отправка остановилась: '+esc(str(exc)[:320])
+            if progress_id is not None and message_text is not None:
+                try:
+                    await self.bot.edit_message_text(message_text,chat_id=chat,
+                        message_id=progress_id,parse_mode='HTML')
+                except (TelegramBadRequest,TelegramForbiddenError) as exc:
+                    log.warning('Could not update temporary channel notice: %s',exc)
+        finally:
+            if progress_id is not None:
+                # The admin can read the result briefly; then nothing remains.
+                await asyncio.sleep(5)
+                await self.safe_delete(chat,progress_id)
 
     async def channel_loop(self):
         # Short heartbeat: configuration changes take effect without restarting.
@@ -787,8 +804,9 @@ class Application:
                         c.extra_messages.append(msg.message_id)
                     return
             if not c.detail_mode:return
-            # Summary and full original description are separated to remain within Telegram limits.
-            v=dict(detail);description=public_text(plain_html(v.pop('detail', '') or ''),multiline=True)
+            # Use structured listing fields only; original free-text descriptions
+            # can contain third-party contact details and unmarked prices.
+            v=dict(detail);v.pop('detail',None)
             summary=details_text(item,v,self.fx.rate,markup=getattr(self,'retail_markup',0),
                                  contact_label=self.contact_label())
             # Protect Telegram's 4096-character HTML limit.
@@ -813,13 +831,7 @@ class Application:
                         c.extra_messages.append(mm.message_id)
             elif len(paths)==1 and paths[0]!=image_url(item.get('coverPicture')):
                 mm=await self.bot.send_photo(c.chat_id,paths[0]);c.extra_messages.append(mm.message_id)
-            # Keep the return button below the gallery and description, not buried above photos.
-            if not c.detail_mode:return
-            if description:
-                for start in range(0,min(len(description),12000),2900):
-                    piece=escape(description[start:start+2900])
-                    mm=await self.bot.send_message(c.chat_id,'📝 <b>Описание</b>\n'+piece,parse_mode='HTML',disable_web_page_preview=True)
-                    c.extra_messages.append(mm.message_id)
+            # Keep the return button below the entire gallery.
             if not c.detail_mode:return
             msg=await self.bot.send_message(c.chat_id,summary,parse_mode='HTML',
                 reply_markup=detail_kb(item,from_channel=c.source=='channel-entry'),disable_web_page_preview=True)
@@ -1130,10 +1142,10 @@ class Application:
                         await self.bot.send_message(m.chat.id,
                             f'⚠️ Введите целое число от 1 до {CHANNEL_TEST_MAX}.')
                     else:
-                        self.task(self.channel_manual_job(uid,m.chat.id,count))
-                        await self.bot.send_message(m.chat.id,
+                        notice=await self.bot.send_message(m.chat.id,
                             f'🧪 Начинаю отправку до {count} объявлений по фильтрам канала. '
                             'Дубли будут пропущены. Проверить прогресс можно в админке.')
+                        self.task(self.channel_manual_job(uid,m.chat.id,count,notice.message_id))
                 elif field=='user_lookup':
                     await self.admin_user_panel(uid,m.chat.id,raw)
                 return

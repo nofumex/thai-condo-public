@@ -95,11 +95,8 @@ def rental_terms(x):
 
 def card_text(x,favorite=False,score=None,rate=None,markup=0,contact_label="Аренда, консультация и подбор квартиры - @nofumez"):
     p=x.get('project') or {};r=x.get('roomInformation') or {};price=price_of(x)
-    name=public_text(p.get('nameEnglish') or p.get('name') or x.get('title')) or 'Квартира'
+    name=public_text(p.get('nameEnglish') or p.get('name')) or 'Квартира'
     lines=[f'🏙 <b>{esc(name)}</b>']
-    title=public_text(x.get('title'))
-    if title and str(title).casefold().strip()!=str(name).casefold().strip():
-        lines.append('<i>'+esc(str(title)[:85])+'</i>')
     district=district_label(x)
     if district:lines.append(f'📍 <b>{esc(district)}</b>')
     if p.get('address'):lines.append('🗺 '+esc(public_text(p['address'])))
@@ -133,7 +130,7 @@ def card_text(x,favorite=False,score=None,rate=None,markup=0,contact_label="Ар
     if x.get('userVerificationStatus') is True:lines.append('✅ Автор верифицирован')
     if score is not None:lines.append(f'✨ <b>Рейтинг: {score:.1f}/100</b> <i>(динамический)</i>')
     if favorite:lines.append('❤️ В избранном')
-    lines.append('👤 <b>'+esc(contact_label)+'</b>')
+    lines.extend(['', '👤 <b>'+esc(contact_label)+'</b>', ''])
     out=[];used=0
     for line in lines:
         if used+len(line)+1>1020:continue
@@ -157,7 +154,7 @@ def details_text(x,detail,rate=None,markup=0,contact_label="Аренда, кон
     price=price_of(v)
     if price is None:price=price_of(x)
     rent=rental_terms(v) or rental_terms(x)
-    title=public_text(p.get('nameEnglish') or p.get('name') or v.get('title') or x.get('title')) or 'Квартира'
+    title=public_text(p.get('nameEnglish') or p.get('name')) or 'Квартира'
     lines=[f'🏙 <b>{esc(title)}</b>']
     district=district_label(v) or district_label(x)
     if district:lines.append('📍 '+esc(district))
@@ -185,7 +182,7 @@ def details_text(x,detail,rate=None,markup=0,contact_label="Аренда, кон
         if isinstance(data,dict):
             marked=[names.get(k,k) for k,val in data.items() if val is True]
             if marked:lines.append('\n<b>'+name+'</b>\n✓ '+esc(', '.join(marked)))
-    lines.append('\n👤 <b>'+esc(contact_label)+'</b>')
+    lines.append('\n👤 <b>'+esc(contact_label)+'</b>\n')
     point=v.get('location') or x.get('location') or {}
     if point.get('lat') is not None and point.get('lng') is not None:
         lines.append(f'\n🗺 {esc(point["lat"])}, {esc(point["lng"])}')

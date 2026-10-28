@@ -54,8 +54,8 @@ def channel_caption(item, username, markup, contact_label, rate=None):
     """HTML photo caption under Telegram's 1024-character limit."""
     rendered = card_text(item, rate=rate, markup=markup, contact_label=contact_label)
     url = deep_link(username, item['id'], 'home')
-    footer = (f'\n\n<a href="{escape(url, quote=True)}">'
-              'БОЛЬШЕ КВАРТИР ПОД ВАШИ КОНКРЕТНЫЕ ПРЕДПОЧТЕНИЯ</a>')
+    footer = (f'\n\n<b><a href="{escape(url, quote=True)}">'
+              'БОЛЬШЕ КВАРТИР ПОД ВАШИ ПРЕДПОЧТЕНИЯ</a></b>')
     lines = rendered.splitlines()
     while lines and len('\n'.join(lines)) + len(footer) > 1000:
         lines.pop(-2 if len(lines) > 2 else -1)
