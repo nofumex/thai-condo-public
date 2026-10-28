@@ -1,0 +1,59 @@
+# Credentials and deployment-only settings
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.*
+credentials.json
+token.json
+*secret*.json
+*credentials*.json
+
+# Python runtime, builds, test caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Private state (favorites, local listing index and cached details)
+data/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.db3
+*.db3-*
+
+# Ephemeral files and logs
+logs/
+*.log
+*.log.*
+tmp/
+temp/
+cache/
+*.bak
+*.backup
+*.zip
+*.7z
+*.rar
+
+# Editor/OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
