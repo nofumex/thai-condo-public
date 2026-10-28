@@ -26,6 +26,8 @@ from .collections import (WINDOWS, COLLECTION_SCAN_PAGES, COLLECTION_MAX_PAGES, 
                           COLLECTION_TARGET, signature, cache_expired, build_buckets)
 from .geography import CITIES, AREAS, AREAS_BY_ID, district_of, city_of
 from .fx import FX
+from .pricing import public_text,retail_price
+from .channel import parse_start,publish_cycle
 from .render import (MAIN,main_kb,filter_kb,filter_summary,choices_kb,payment_filter_text,payment_filter_kb,card_text,card_kb,
                      details_text,detail_kb,kb,b,link,esc,money)
 log=logging.getLogger(__name__)
@@ -69,6 +71,7 @@ class Catalog:
     scanned_pages:int=0
     skipped_corrupt:int=0
     stale_pages:int=0
+    last_counted_id:Optional[str]=None
 
 class Application:
     def __init__(self,cfg:Config):
@@ -79,6 +82,10 @@ class Application:
         self.catalogs:dict[int,Catalog]={};self.pending:dict[int,tuple[str,str,int]]={}
         self.tasks:set[asyncio.Task]=set();self.started=datetime.now(timezone.utc)
         self.photo_cache:dict[str,str]={};self.sync_lock=asyncio.Lock()
+        self.retail_markup=0
+        self.admin_pending={}
+        self.channel_lock=asyncio.Lock()
+
         # Per-user jobs with debounce; single shared background crawler prevents
         # concurrent 80-page scans from saturating the PropertyHub API.
         self.collection_tasks:dict[int,asyncio.Task]={}
@@ -114,6 +121,98 @@ class Application:
         self.panels[uid]=m.message_id
         return m.message_id
 
+    def contact_label(self):
+        return getattr(getattr(self,'cfg',None),'contact_label',
+                       'Аренда, консультация и подбор квартиры - @nofumez')
+
+    async def profile(self,uid,kind):
+        if kind=='channel':
+            return clean(await self.db.get_config('channel_filters',{}))
+        return await self.db.get_filters(uid,kind)
+
+    async def channel_panel(self,uid,chat):
+        if uid!=self.cfg.admin_id:return
+        enabled=await self.db.get_config('channel_enabled',False)
+        interval=int(await self.db.get_config('channel_interval_minutes',5))
+        f=await self.profile(uid,'channel')
+        st=await self.db.channel_stats()
+        err=await self.db.get_config('channel_last_error')
+        checked=await self.db.get_config('channel_last_check')
+        self.panel_kind[uid]='channel'
+        txt=('<b>📢 Канал · '+esc(self.cfg.channel_chat)+'</b>\n\n'
+             f'Публикация: <b>{"включена" if enabled else "выключена"}</b>\n'
+             f'Интервал проверки: <b>{interval} мин.</b>\n'
+             f'Фильтры: {esc(concise(f))}\n'
+             f'Опубликовано: {st["posts"]} · переходов: {st["clicks"]} '
+             f'({st["users"]} уник.)\n\n'
+             '<i>После включения публикуются только новые объявления. Старые посты не рассылаются.</i>'
+             +(f'\n\n⚠️ Последняя ошибка: {esc(err)}' if err else '')
+             +(f'\n🕓 Проверено: {esc(str(checked)[:16])}' if checked else ''))
+        await self.panel(uid,chat,txt,kb([
+            [b(('⏸ Выключить' if enabled else '▶️ Включить'),'admin:channel_toggle')],
+            [b('🎯 Фильтры публикаций','admin:channel_filters')],
+            [b('⏱ Интервал','admin:channel_interval'),b('🔄 Проверить сейчас','admin:channel_check')],
+            [b('← Админка','go:admin')]]))
+
+    async def channel_cycle(self):
+        if self.channel_lock.locked():return 0
+        async with self.channel_lock:
+            try:
+                count=await publish_cycle(self)
+                await self.db.set_config('channel_last_error',None)
+                await self.db.set_config('channel_last_check',datetime.now(timezone.utc).isoformat())
+                return count
+            except Exception as exc:
+                await self.db.set_config('channel_last_error',str(exc)[:350])
+                log.exception('Channel posting failed: %s',exc)
+                return 0
+
+    async def channel_loop(self):
+        # Short heartbeat: configuration changes take effect without restarting.
+        import time
+        last=0
+        while True:
+            try:
+                if await self.db.get_config('channel_enabled',False):
+                    seconds=max(60,int(await self.db.get_config('channel_interval_minutes',5))*60)
+                    if time.monotonic()-last>=seconds:
+                        last=time.monotonic()
+                        await self.channel_cycle()
+                else:last=0
+            except asyncio.CancelledError:raise
+            except Exception:log.exception('Channel scheduler tick')
+            await asyncio.sleep(15)
+
+    async def admin_user_panel(self,uid,chat,identifier):
+        result=await self.db.user_report(identifier)
+        if not result:
+            await self.panel(uid,chat,'👤 Пользователь не найден.\n\n'
+                'Учёт ведётся только по тем, кто взаимодействовал с ботом.',
+                kb([[b('🔎 Другой пользователь','admin:users')],[b('← Админка','go:admin')]]))
+            return
+        u=result['user'];sources=result['referrals']
+        lines=[f'<b>👤 {esc(u["first_name"] or "Пользователь")}</b>',
+               f'ID: <code>{u["id"]}</code>',
+               f'Username: @{esc(u["username"])}' if u['username'] else 'Username: не указан',
+               f'Впервые: {esc(u["created_at"])}',f'Последняя активность: {esc(u["last_seen"])}',
+               f'👁 Просмотров карточек: <b>{u["cards"] or 0}</b> '
+               f'📸 Нажатий «Подробнее»: <b>{u["details"] or 0}</b>',
+               f'🔎 Поисковых запросов: {u["requests"] or 0}',
+               f'❤️ Избранное: {result["favorites"]} · 🙈 Скрыто: {result["hidden"]}',
+               f'📨 Переходов из канала: <b>{result["referral_total"]}</b>']
+        lines.append(f'📋 Уникальных объявлений просмотрено: {result["listing_views"]["unique_n"]}')
+        if result['first_referral']:
+            first=result['first_referral']
+            lines.append(f'Первый переход: квартира {first["listing_id"]} · пост #{first["post_message_id"] or "?"}')
+        if sources:
+            lines.append('\n<b>Последние переходы:</b>')
+            for src in sources[:12]:
+                mode='Подробнее' if src['route']=='detail' else 'Главное меню'
+                lines.append(f'• {esc(src["arrived_at"][:16])} · {mode} · квартира {src["listing_id"]}'
+                             +(f' · пост #{src["post_message_id"]}' if src['post_message_id'] else ''))
+        await self.panel(uid,chat,'\n'.join(lines),kb([
+            [b('🔎 Другой пользователь','admin:users')],[b('← Админка','go:admin')]]))
+
     async def home(self,uid,chat):
         self.pending.pop(uid,None)
         self.panel_kind[uid]='home'
@@ -137,11 +236,11 @@ class Application:
 
     async def filters(self,uid,chat,kind):
         self.panel_kind[uid]='filter:'+kind
-        f=await self.db.get_filters(uid,kind)
+        f=await self.profile(uid,kind)
         await self.panel(uid,chat,filter_summary(kind,f),filter_kb(kind,f))
 
     async def district_panel(self,uid,chat,kind,f):
-        prefix='f:'+('s' if kind=='search' else 'l')+':'
+        prefix='f:'+('s' if kind=='search' else 'c' if kind=='channel' else 'l')+':'
         if not f['region']:
             rows=[[b(CITIES[k].title,prefix+'locpreset:'+k)] for k in CITIES]
             rows.append([b('← Назад',prefix+'menu')])
@@ -167,6 +266,15 @@ class Application:
         if mids:await asyncio.gather(*(remove(mid) for mid in mids),return_exceptions=True)
         c.detail_mode=False
 
+    async def _record_card(self,c,item):
+        ident=str(item['id'])
+        if c.last_counted_id==ident:return
+        c.last_counted_id=ident
+        if hasattr(self.db,'note_card'):
+            await self.db.note_card(c.owner,ident)
+        else:
+            await self.db.metric(c.owner,'cards')
+
     async def _send_card(self,c:Catalog,index:int,replace:bool=True):
         if not c.ids:return
         index=max(0,min(index,len(c.ids)-1))
@@ -178,7 +286,8 @@ class Application:
         # Never rely on saved rank: favorites must depreciate with elapsed time.
         ranked_items=await self.db.listings_by_ids(c.ids[:800])
         current_score,_=score(item,comparables(ranked_items))
-        text=card_text(item,favorite,current_score,self.fx.rate)
+        text=card_text(item,favorite,current_score,self.fx.rate,
+                       markup=getattr(self,'retail_markup',0),contact_label=self.contact_label())
         if c.stale_pages:
             text+='\n<i>⚠️ Данные из кэша: актуальность уточняйте у владельца.</i>'
         markup=card_kb(item,index,len(c.ids),favorite,not c.done,c.provider_total if c.source!='collection' else None)
@@ -189,13 +298,13 @@ class Application:
                 try:
                     await self.bot.edit_message_media(chat_id=c.chat_id,message_id=c.message_id,
                         media=InputMediaPhoto(media=cached_photo or photo,caption=text,parse_mode='HTML'),reply_markup=markup)
-                    await self.db.metric(uid,'cards');return
+                    await self._record_card(c,item);return
                 except TelegramBadRequest as e:log.debug('edit media fallback: %s',e)
             if c.kind=='text' and not photo:
                 try:
                     await self.bot.edit_message_text(chat_id=c.chat_id,message_id=c.message_id,
                         text=text,parse_mode='HTML',reply_markup=markup,disable_web_page_preview=True)
-                    await self.db.metric(uid,'cards');return
+                    await self._record_card(c,item);return
                 except TelegramBadRequest as e:
                     if 'message is not modified' in str(e):return
             await self.safe_delete(c.chat_id,c.message_id);c.message_id=None
@@ -206,14 +315,24 @@ class Application:
                 c.kind='photo'
                 if m.photo:self.photo_cache[str(item['id'])]=m.photo[-1].file_id
             except TelegramBadRequest:
-                m=await self.bot.send_message(c.chat_id,text+'\n\n🖼 '+esc(photo),parse_mode='HTML',reply_markup=markup,
+                m=await self.bot.send_message(c.chat_id,text+'\n\n<i>🖼 Фото временно недоступно.</i>',parse_mode='HTML',reply_markup=markup,
                     disable_web_page_preview=True)
                 c.kind='text'
         else:
             m=await self.bot.send_message(c.chat_id,text,parse_mode='HTML',reply_markup=markup)
             c.kind='text'
         c.message_id=m.message_id
-        await self.db.metric(uid,'cards')
+        await self._record_card(c,item)
+
+    def _provider_filters(self,filters):
+        """UI price filters refer to public retail prices, not upstream rent."""
+        norm=clean(filters)
+        markup=max(0,int(getattr(self,'retail_markup',0)))
+        if markup:
+            for key in ('price_min','price_max'):
+                if norm.get(key) is not None:
+                    norm[key]=max(0,int(norm[key])-markup)
+        return norm
 
     @staticmethod
     def _server_cache_key(filters):
@@ -230,10 +349,11 @@ class Application:
         Concurrent requests for the same server query and page share one task.
         User cancellation does not cancel a common fetch required by others.
         """
+        upstream=self._provider_filters(filters)
         if not (hasattr(self.db,'get_search_page') and hasattr(self.api,'search_page_unfiltered')):
             reader=getattr(self.api,'search_page_resilient',self.api.search_page)
-            return await reader(filters,page=page,per_page=60)
-        key=self._server_cache_key(filters)
+            return await reader(upstream,page=page,per_page=60)
+        key=self._server_cache_key(upstream)
         cache=await self.db.get_search_page(key,page,max_age_minutes=cache_minutes)
         if cache is None:
             flights=getattr(self,'page_inflight',None)
@@ -246,7 +366,7 @@ class Application:
                     # Read again after queuing; a completed fetch may have stored it.
                     value=await self.db.get_search_page(key,page,max_age_minutes=cache_minutes)
                     if value is not None:return value
-                    raw,meta=await self.api.search_page_unfiltered(filters,page=page,per_page=60)
+                    raw,meta=await self.api.search_page_unfiltered(upstream,page=page,per_page=60)
                     await self.db.store_search_page(key,page,raw,meta)
                     return raw,meta
                 task=asyncio.create_task(fetch())
@@ -268,7 +388,7 @@ class Application:
                 cache=old_rows,{**old_meta,'staleCache':True}
                 log.warning('PropertyHub unavailable; using cached page=%s: %s',page,exc)
         raw,meta=cache
-        return [x for x in raw if matches_local(x,filters)],dict(meta)
+        return [x for x in raw if matches_local(x,upstream)],dict(meta)
 
     async def _provider_page(self,c:Catalog,page:int):
         """Read a page without discarding 59 good listings when one is broken."""
@@ -283,6 +403,14 @@ class Application:
         return rows
 
     async def _save_filters(self,uid,kind,f):
+        if kind=='channel':
+            previous=await self.profile(uid,'channel')
+            changed=clean(f)!=previous
+            if changed:
+                await self.db.set_config('channel_filters',clean(f))
+                # Never retro-post historic ads when an admin changes the filter.
+                await self.db.set_config('channel_watermark',datetime.now(timezone.utc).isoformat())
+            return changed
         changed=await self.db.save_filters(uid,kind,f)
         if changed and kind=='latest':
             self.schedule_collection(uid,replace=True)
@@ -446,7 +574,7 @@ class Application:
         hidden=set(await self.db.listing_ids(uid,'hidden'))
         data=await self.db.listings_by_ids(ids)
         allowed={str(item['id']) for item in data
-                 if age_days(item)<=days and matches_local(item,filters)}
+                 if age_days(item)<=days and matches_local(item,self._provider_filters(filters))}
         shown=[ident for ident in ids if ident in allowed and ident not in hidden]
         if not shown:
             self.panel_kind[uid]='collection-empty'
@@ -617,13 +745,14 @@ class Application:
                         msg=await self.bot.send_message(c.chat_id,
                             '⚠️ Полная карточка временно недоступна на PropertyHub.\n'
                             'Основные характеристики уже показаны выше.',
-                            reply_markup=detail_kb(item))
+                            reply_markup=detail_kb(item,from_channel=c.source=='channel-entry'))
                         c.extra_messages.append(msg.message_id)
                     return
             if not c.detail_mode:return
             # Summary and full original description are separated to remain within Telegram limits.
-            v=dict(detail);description=plain_html(v.pop('detail', '') or '')
-            summary=details_text(item,v,self.fx.rate)
+            v=dict(detail);description=public_text(plain_html(v.pop('detail', '') or ''),multiline=True)
+            summary=details_text(item,v,self.fx.rate,markup=getattr(self,'retail_markup',0),
+                                 contact_label=self.contact_label())
             # Protect Telegram's 4096-character HTML limit.
             if len(summary)>3650:summary=summary[:3600]+'…'
             images=(detail.get('images') or []) if isinstance(detail,dict) else []
@@ -655,7 +784,7 @@ class Application:
                     c.extra_messages.append(mm.message_id)
             if not c.detail_mode:return
             msg=await self.bot.send_message(c.chat_id,summary,parse_mode='HTML',
-                reply_markup=detail_kb(item),disable_web_page_preview=True)
+                reply_markup=detail_kb(item,from_channel=c.source=='channel-entry'),disable_web_page_preview=True)
             c.extra_messages.append(msg.message_id)
         except (TelegramBadRequest,TelegramForbiddenError) as e:
             log.warning('Detail UI error %s',e)
@@ -668,6 +797,7 @@ class Application:
         for x in rows:
             rent=price_of(x)
             if rent is None:continue
+            rent=retail_price(rent,getattr(self,'retail_markup',0))
             area=district_of(x)
             p=x.get('project') or {}
             key=(area.id if area else None) if by!='project' else (p.get('nameEnglish') or p.get('name'))
@@ -707,6 +837,8 @@ class Application:
         if uid!=self.cfg.admin_id:return
         st=await self.db.stats();disabled=await self.db.get_config('maintenance',False)
         sync=await self.db.get_config('sync_enabled',True)
+        markup=int(await self.db.get_config('retail_markup_thb',0))
+        self.retail_markup=markup
         uptime=datetime.now(timezone.utc)-self.started
         text=('<b>🛠 Админка</b>\n\n'
               f'👥 Пользователи: <b>{st["users"]}</b> · за 24ч: {st["daily"]}\n'
@@ -717,11 +849,14 @@ class Application:
               f'🤖 Режим обслуживания: {"вкл." if disabled else "выкл."}\n'
               f'📡 Фоновое обновление: {"вкл." if sync else "выкл."}\n'
               f'💱 THB/RUB: {self.fx.rate or "недоступен"} (ЦБ РФ)\n'
+              f'💰 Наценка: <b>{money(markup)} ฿/мес.</b>\n'
               f'🌐 API: {esc(self.api.last_error[:150] or "последний запрос успешен")}')
         await self.panel(uid,chat,text,kb([
             [b('🔁 Обновить базу сейчас','admin:sync'),b('📊 Обновить статистику','admin:stats')],
             [b(('⛔ Обслуживание: вкл.' if disabled else '✅ Обслуживание: выкл.'),'admin:maintenance')],
             [b(('📡 Автосбор: вкл.' if sync else '📡 Автосбор: выкл.'),'admin:background')],
+            [b('💰 Наценка','admin:markup'),b('📢 Канал','admin:channel')],
+            [b('👤 Пользователи','admin:users')],
             [b('💱 Обновить курс','admin:fx')],[b('← Меню','go:home')]]))
 
     async def sync_once(self,pages=3):
@@ -754,7 +889,29 @@ class Application:
             if not message.from_user:return
             uid=message.from_user.id;await self.db.user(message.from_user)
             await self.close_catalog(uid)
-            await self.home(uid,message.chat.id)
+            intent=parse_start(message.text or '')
+            if intent:
+                route,listing_id=intent
+                await self.db.record_referral(uid,listing_id,route)
+                if route=='detail':
+                    item,_=await self.db.get_listing(listing_id)
+                    if item:
+                        c=Catalog(message.chat.id,uid,'channel-entry','Квартира из канала',clean(DEFAULT),
+                                  ids=[str(listing_id)],done=True)
+                        self.catalogs[uid]=c
+                        self.panel_kind[uid]='catalog'
+                        await self._send_card(c,0,replace=False)
+                        await self.db.note_detail(uid,listing_id)
+                        c.detail_mode=True
+                        c.detail_task=self.task(self.show_detail(c))
+                    else:
+                        await self.home(uid,message.chat.id)
+                        await self.bot.send_message(message.chat.id,
+                            'Квартира из поста пока недоступна в базе. Можно подобрать другие варианты.')
+                else:
+                    await self.home(uid,message.chat.id)
+            else:
+                await self.home(uid,message.chat.id)
             await self.ensure_collection(uid)
             await self.safe_delete(message.chat.id,message.message_id)
 
@@ -794,19 +951,24 @@ class Application:
             uid=q.from_user.id
             await self.db.user(q.from_user)
             await self.close_catalog(uid)
-            await self.filters(uid,q.message.chat.id,q.data.split(':')[1])
+            kind=q.data.split(':')[1]
+            if kind=='channel' and uid!=self.cfg.admin_id:return
+            await self.filters(uid,q.message.chat.id,kind)
 
         @r.callback_query(F.data.startswith('f:'))
         async def filter_action(q:CallbackQuery):
             await q.answer()
             uid=q.from_user.id;chat=q.message.chat.id
-            bits=q.data.split(':');kind='search' if bits[1]=='s' else 'latest'
+            bits=q.data.split(':');kind={'s':'search','l':'latest','c':'channel'}.get(bits[1])
+            if kind is None or (kind=='channel' and uid!=self.cfg.admin_id):return
             action=bits[2] if len(bits)>2 else 'menu'
-            f=await self.db.get_filters(uid,kind)
+            f=await self.profile(uid,kind)
             prefix='f:'+bits[1]+':'
             if action=='noop':return
             if action=='run':
-                await self.launch(uid,chat,kind,f);return
+                if kind=='channel':await self.channel_panel(uid,chat)
+                else:await self.launch(uid,chat,kind,f)
+                return
             if action=='menu':await self.filters(uid,chat,kind);return
             if action=='locpreset':
                 val=bits[3] if len(bits)>3 else ''
@@ -861,6 +1023,7 @@ class Application:
             if action=='reset':f=clean(DEFAULT)
             elif action=='copy':
                 other='latest' if kind=='search' else 'search'
+                if kind=='channel':return
                 await self._save_filters(uid,other,f)
             elif action=='room':
                 rows=[]
@@ -894,9 +1057,39 @@ class Application:
         async def input_message(m:Message):
             if not m.from_user:return
             uid=m.from_user.id
+            if uid in getattr(self,'admin_pending',{}) and uid==self.cfg.admin_id:
+                field,prompt=self.admin_pending.pop(uid)
+                raw=(m.text or '').strip()
+                await self.safe_delete(m.chat.id,m.message_id)
+                await self.safe_delete(m.chat.id,prompt)
+                if field=='markup':
+                    try:
+                        amount=int(raw)
+                        if not 0<=amount<=1000000:raise ValueError('Наценка: целое от 0 до 1 000 000 THB')
+                        old=int(getattr(self,'retail_markup',0))
+                        await self.db.set_config('retail_markup_thb',amount)
+                        self.retail_markup=amount
+                        if old!=amount:
+                            await self.db.invalidate_collections()
+                            for other_uid in await self.db.active_collection_users(days=30):
+                                self.schedule_collection(other_uid,replace=True)
+                        await self.admin(uid,m.chat.id)
+                    except ValueError:
+                        await self.bot.send_message(m.chat.id,'⚠️ Введите целое число от 0 до 1000000.')
+                elif field=='channel_interval':
+                    try:
+                        minutes=int(raw)
+                        if not 1<=minutes<=1440:raise ValueError()
+                        await self.db.set_config('channel_interval_minutes',minutes)
+                        await self.channel_panel(uid,m.chat.id)
+                    except ValueError:
+                        await self.bot.send_message(m.chat.id,'⚠️ Интервал: от 1 до 1440 минут.')
+                elif field=='user_lookup':
+                    await self.admin_user_panel(uid,m.chat.id,raw)
+                return
             if uid not in self.pending:return
             kind,field,prompt=self.pending.pop(uid)
-            f=await self.db.get_filters(uid,kind)
+            f=await self.profile(uid,kind)
             raw=(m.text or '').strip()
             try:
                 if field in ('price','area'):
@@ -993,6 +1186,7 @@ class Application:
                 await self._send_card(c,min(c.index,len(c.ids)-1))
             elif action=='detail':
                 if c.detail_mode:return
+                await self.db.note_detail(uid,id)
                 c.detail_mode=True
                 c.detail_task=self.task(self.show_detail(c))
             elif action=='detailback':
@@ -1014,13 +1208,38 @@ class Application:
             elif action=='sync':
                 self.task(self.sync_once(3))
                 await self.bot.send_message(q.message.chat.id,'🔄 Обновление индекса запущено в фоне.')
+            elif action in ('markup','users','channel_interval'):
+                prompts={
+                    'markup':'Введите наценку в THB (целое число, от 0 до 1000000). 0 — отключить.',
+                    'users':'Введите Telegram ID или username пользователя (@username).',
+                    'channel_interval':'Введите период проверки новых объявлений в минутах (1–1440).'}
+                m=await self.bot.send_message(q.message.chat.id,'✍️ '+prompts[action])
+                self.admin_pending[q.from_user.id]=('user_lookup' if action=='users' else action,m.message_id)
+                return
+            elif action=='channel':
+                await self.channel_panel(q.from_user.id,q.message.chat.id);return
+            elif action=='channel_filters':
+                await self.filters(q.from_user.id,q.message.chat.id,'channel');return
+            elif action=='channel_toggle':
+                enabled=await self.db.get_config('channel_enabled',False)
+                await self.db.set_config('channel_enabled',not enabled)
+                if not enabled:
+                    await self.db.set_config('channel_watermark',datetime.now(timezone.utc).isoformat())
+                await self.channel_panel(q.from_user.id,q.message.chat.id);return
+            elif action=='channel_check':
+                self.task(self.channel_cycle())
+                await self.channel_panel(q.from_user.id,q.message.chat.id)
+                await self.bot.send_message(q.message.chat.id,'🔄 Проверка новых объявлений запущена.')
+                return
             elif action=='fx':self.task(self.fx.refresh())
             await self.admin(q.from_user.id,q.message.chat.id)
 
     async def run(self):
         await self.db.init()
+        self.retail_markup=max(0,int(await self.db.get_config('retail_markup_thb',0)))
         self.task(self.background_sync());self.task(self.fx.loop())
         self.task(self.collection_maintenance())
+        self.task(self.channel_loop())
         try:
             await self.bot.delete_webhook(drop_pending_updates=False)
             await self.dp.start_polling(self.bot,handle_as_tasks=True)

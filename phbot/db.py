@@ -53,6 +53,28 @@ class Database:
         );
         CREATE INDEX IF NOT EXISTS idx_search_pages_fetched ON search_pages(fetched_at);
         CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS channel_posts (
+          listing_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, message_id INTEGER NOT NULL,
+          created_at TEXT NOT NULL, source_created_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_channel_posts_date ON channel_posts(created_at DESC);
+        CREATE TABLE IF NOT EXISTS referral_visits (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+          listing_id TEXT NOT NULL, route TEXT NOT NULL,
+          post_message_id INTEGER, arrived_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_referral_user ON referral_visits(user_id,arrived_at DESC);
+        CREATE TABLE IF NOT EXISTS listing_views (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,
+          listing_id TEXT NOT NULL,viewed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_view_user ON listing_views(user_id);
+        CREATE TABLE IF NOT EXISTS detail_views (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,
+          listing_id TEXT NOT NULL,viewed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_detail_user ON detail_views(user_id);
+
         ''')
         # Safe migration for databases created by earlier bot versions.
         async with self.conn.execute('PRAGMA table_info(listings)') as cursor:
@@ -67,6 +89,10 @@ class Database:
             await self.conn.execute("ALTER TABLE collection_cache ADD COLUMN window_counts_json TEXT NOT NULL DEFAULT '{}'")
         if 'target_pages' not in cc:
             await self.conn.execute('ALTER TABLE collection_cache ADD COLUMN target_pages INTEGER NOT NULL DEFAULT 480')
+        async with self.conn.execute('PRAGMA table_info(users)') as cursor:
+            uc={r['name'] for r in await cursor.fetchall()}
+        if 'details' not in uc:
+            await self.conn.execute('ALTER TABLE users ADD COLUMN details INTEGER NOT NULL DEFAULT 0')
         await self.conn.commit()
     async def close(self):
         if self.conn:await self.conn.close()
@@ -313,6 +339,69 @@ class Database:
     async def set_config(self,key,val):
         await self.conn.execute('INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,json.dumps(val)))
         await self.conn.commit()
+    async def invalidate_collections(self):
+        # Invalidate cached result pools when public price markup changes.
+        await self.conn.execute('''UPDATE collection_cache SET
+          filter_signature='retail-markup-changed',status='pending',
+          scanned_pages=0,candidates=0,skipped_corrupt=0,
+          buckets_json='{}',candidate_ids_json='[]',window_counts_json='{}',
+          completed_at=NULL,error=NULL,updated_at=?''',(utc(),))
+        await self.conn.commit()
+
+    async def note_card(self,uid,listing_id):
+        await self.conn.execute('UPDATE users SET cards=cards+1 WHERE id=?',(uid,))
+        await self.conn.execute('INSERT INTO listing_views(user_id,listing_id,viewed_at) VALUES(?,?,?)',
+                                (uid,str(listing_id),utc()))
+        await self.conn.commit()
+
+    async def note_detail(self,uid,listing_id):
+        await self.conn.execute('UPDATE users SET details=details+1 WHERE id=?',(uid,))
+        await self.conn.execute('INSERT INTO detail_views(user_id,listing_id,viewed_at) VALUES(?,?,?)',
+                                (uid,str(listing_id),utc()))
+        await self.conn.commit()
+
+    async def channel_post_exists(self,listing_id):
+        return bool(await self._one('SELECT 1 FROM channel_posts WHERE listing_id=?',(str(listing_id),)))
+
+    async def save_channel_post(self,listing_id,chat,message_id,source_created_at):
+        await self.conn.execute('''INSERT OR IGNORE INTO channel_posts
+          (listing_id,chat_id,message_id,created_at,source_created_at) VALUES(?,?,?,?,?)''',
+          (str(listing_id),str(chat),int(message_id),utc(),source_created_at))
+        await self.conn.commit()
+
+    async def record_referral(self,uid,listing_id,route):
+        row=await self._one('SELECT message_id FROM channel_posts WHERE listing_id=?',(str(listing_id),))
+        message_id=row['message_id'] if row else None
+        await self.conn.execute('''INSERT INTO referral_visits
+          (user_id,listing_id,route,post_message_id,arrived_at) VALUES(?,?,?,?,?)''',
+          (uid,str(listing_id),route,message_id,utc()))
+        await self.conn.commit()
+
+    async def user_report(self,identifier):
+        ident=str(identifier or '').strip().lstrip('@')
+        row=await (self._one('SELECT * FROM users WHERE id=?',(int(ident),)) if ident.isdigit()
+                   else self._one('SELECT * FROM users WHERE lower(username)=lower(?) ORDER BY last_seen DESC LIMIT 1',(ident,)))
+        if not row:return None
+        uid=row['id']
+        sources=await self._all('''SELECT r.listing_id,r.route,r.post_message_id,r.arrived_at,p.chat_id
+                       FROM referral_visits r LEFT JOIN channel_posts p ON r.listing_id=p.listing_id
+                       WHERE r.user_id=? ORDER BY r.id DESC LIMIT 20''',(uid,))
+        detail=await self._one('SELECT COUNT(*) AS n,COUNT(DISTINCT listing_id) AS unique_n FROM detail_views WHERE user_id=?',(uid,))
+        viewed=await self._one('SELECT COUNT(*) AS n,COUNT(DISTINCT listing_id) AS unique_n FROM listing_views WHERE user_id=?',(uid,))
+        referral_total=await self._one('SELECT COUNT(*) AS n FROM referral_visits WHERE user_id=?',(uid,))
+        first_ref=await self._one('SELECT listing_id,route,post_message_id,arrived_at FROM referral_visits WHERE user_id=? ORDER BY id ASC LIMIT 1',(uid,))
+        f=await self._one('SELECT COUNT(*) AS n FROM favorites WHERE user_id=?',(uid,))
+        h=await self._one('SELECT COUNT(*) AS n FROM hidden WHERE user_id=?',(uid,))
+        return {'user':dict(row),'referrals':[dict(x) for x in sources],
+                'detail_views':dict(detail),'listing_views':dict(viewed),
+                'referral_total':referral_total['n'],'first_referral':dict(first_ref) if first_ref else None,
+                'favorites':f['n'],'hidden':h['n']}
+
+    async def channel_stats(self):
+        count=await self._one('SELECT COUNT(*) AS n FROM channel_posts')
+        traffic=await self._one('SELECT COUNT(*) AS n,COUNT(DISTINCT user_id) AS users FROM referral_visits')
+        return {'posts':count['n'],'clicks':traffic['n'],'users':traffic['users']}
+
     async def stats(self):
         row=await self._one('''SELECT COUNT(*) AS users,SUM(requests) AS requests,SUM(cards) AS cards,
                          SUM(CASE WHEN last_seen>=? THEN 1 ELSE 0 END) AS daily FROM users''',
