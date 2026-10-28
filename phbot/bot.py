@@ -27,6 +27,7 @@ from .geography import CITIES, AREAS, AREAS_BY_ID, district_of, city_of
 from .fx import FX
 from .pricing import retail_price
 from .channel import parse_start,publish_cycle,publish_manual,CHANNEL_TEST_MAX
+from .sponsor import sort_items, is_regular, free_page_is_old, timestamp
 from .render import (MAIN,main_kb,filter_kb,filter_summary,choices_kb,payment_filter_text,payment_filter_kb,card_text,card_kb,
                      details_text,detail_kb,kb,b,link,esc,money)
 log=logging.getLogger(__name__)
@@ -35,6 +36,7 @@ log=logging.getLogger(__name__)
 # deserves substantially deeper initial scanning, but an interactive Telegram
 # request must not synchronously crawl the entire provider catalog.
 SEARCH_STANDARD_PAGES = 8
+SEARCH_SPONSORED_ALLOWANCE = 12  # ads never consume the FREE-page budget
 SEARCH_RARE_PAGES = 48
 SEARCH_RARE_TARGET = 80
 COLLECTION_WAIT_POLL_SECONDS = 3
@@ -147,14 +149,14 @@ class Application:
              f'Опубликовано: {st["posts"]} · переходов: {st["clicks"]} '
              f'({st["users"]} уник.)\n\n'
              '<i>При первом включении фиксируется исходная выборка без рассылки. '
-             'Далее публикуются впервые обнаруженные ID, без дублей.</i>')
+             'Далее публикуются только объявления, созданные после включения, без дублей.</i>')
         if cycle:
             status='Базовая выборка сохранена' if cycle.get('status')=='baseline' else 'Проверка завершена'
             if cycle.get('status')=='error':status='Ошибка проверки'
             if cycle.get('status')=='posting':status='Публикация выполняется'
             txt+=(f'\n\n<b>🔎 {status}</b>'
                   f'\nПросмотрено: {cycle.get("scanned_rows",0)} объявл. / {cycle.get("scanned_pages",0)} стр.'
-                  f'\nНовых ID: {cycle.get("new",0)} · опубликовано: {cycle.get("posted",0)}'
+                  f'\nНовых объявлений: {cycle.get("new",0)} · опубликовано: {cycle.get("posted",0)}'
                   f' · очередь: {cycle.get("pending",0)}')
         if manual:
             txt+=(f'\n\n🧪 Ручная отправка: {manual.get("posted",0)}/{manual.get("requested",0)}'
@@ -443,7 +445,16 @@ class Application:
                 cache=old_rows,{**old_meta,'staleCache':True}
                 log.warning('PropertyHub unavailable; using cached page=%s: %s',page,exc)
         raw,meta=cache
-        return [x for x in raw if matches_local(x,upstream)],dict(meta)
+        meta=dict(meta)
+        # Local-only filters can hide the FREE transition. Preserve a small
+        # chronology summary of the unfiltered server response, not the rows.
+        from .sponsor import timestamp
+        meta['_raw_has_regular']=any(is_regular(x) for x in raw)
+        if raw and all(is_regular(x) for x in raw):
+            dates=[timestamp(x.get('createdAt')) for x in raw]
+            if dates and all(d is not None for d in dates):
+                meta['_raw_regular_newest']=max(dates).isoformat()
+        return [x for x in raw if matches_local(x,upstream)],meta
 
     async def _provider_page(self,c:Catalog,page:int):
         """Read a page without discarding 59 good listings when one is broken."""
@@ -455,6 +466,7 @@ class Application:
         c.total_pages=max(1,int(meta.get('totalPages') or c.total_pages or 1))
         c.next_page=page+1
         if c.next_page>c.total_pages:c.done=True
+        c._page_has_regular=meta.get('_raw_has_regular',any(is_regular(x) for x in rows))
         return rows
 
     async def _save_filters(self,uid,kind,f):
@@ -486,13 +498,13 @@ class Application:
         return task
 
     async def ensure_collection(self,uid):
-        """Queue stale/missing snapshots, never request PropertyHub in callbacks."""
+        """Queue missing/incomplete snapshots, never request PropertyHub in callbacks."""
         cache=await self.db.get_collection_cache(uid)
         if await self.db.collection_needs_refresh(uid):
             self.schedule_collection(uid)
 
     async def _prepare_collections(self,uid,delay=1.0):
-        """Build a usable 80-page snapshot, then improve it up to 480 pages.
+        """Build one shared snapshot per settings signature, up to 480 pages.
 
         Each stage releases the per-provider throttle so other users' setting
         changes are not stuck behind one uninterrupted 480-page crawl.
@@ -507,8 +519,9 @@ class Application:
                 ready=(cache.get('status')=='ready' and
                        all(str(d) in (cache.get('buckets') or {}) for d in WINDOWS))
                 scanned=int(cache.get('scanned_pages') or 0)
-                if ready and scanned>=COLLECTION_MAX_PAGES and not cache_expired(cache):return
-                reset=ready and scanned>=COLLECTION_MAX_PAGES
+                target_pages=int(cache.get('target_pages') or COLLECTION_MAX_PAGES)
+                if ready and scanned>=target_pages:return
+                reset=False
             else:
                 scanned=0;reset=False
             if not await self.db.begin_collection_build(uid,sig,reset=reset):return
@@ -523,6 +536,8 @@ class Application:
                 counts={str(d):sum(age_days(x)<=d for x in previous) for d in WINDOWS}
             skipped=int(cache.get('skipped_corrupt') or 0) if not reset else 0
             scan_filter=dict(filters);scan_filter['sort']='CREATED_AT'
+            old_free_streak=0
+            horizon=datetime.now(timezone.utc)-timedelta(days=30)
             hidden=set(await self.db.listing_ids(uid,'hidden'))
             total_pages=COLLECTION_MAX_PAGES
             max_pages=COLLECTION_MAX_PAGES
@@ -543,6 +558,15 @@ class Application:
                                 for days in WINDOWS:
                                     if age<=days:counts[str(days)]+=1
                         scanned=page
+                        raw_newest=timestamp(meta.get('_raw_regular_newest'))
+                        if ((raw_newest is not None and raw_newest<horizon)
+                                or (raw_newest is None and free_page_is_old(rows,horizon))):
+                            old_free_streak+=1
+                        else:
+                            old_free_streak=0
+                        if old_free_streak>=2:
+                            # The ordered FREE stream has already passed 30 days.
+                            total_pages=page
                         if page%5==0 or page>=total_pages:
                             await self.db.collection_progress(uid,sig,scanned,len(ids),skipped,ids,counts)
                         if page>=total_pages:break
@@ -555,6 +579,8 @@ class Application:
                     else:
                         saved=await self.db.finish_collection_build(uid,sig,buckets,scanned,len(ids),skipped)
                     if not saved:return
+                    if scanned>=total_pages and hasattr(self.db,'set_collection_target_pages'):
+                        await self.db.set_collection_target_pages(uid,sig,total_pages)
                     log.info('Collection milestone uid=%s pages=%s candidates=%s buckets=%s',
                              uid,scanned,len(ids),{k:len(v) for k,v in buckets.items()})
                 # Yield to the next waiting user's 80-page stage.
@@ -573,39 +599,88 @@ class Application:
              b('📆 30 дней','go:collection:30')],
             [b('← Назад','go:home')]]))
 
-    async def _collection_wait(self,uid,chat,days,sig):
-        """Watch SQLite, not PropertyHub. Auto-open as soon as first batch is ready."""
+    @staticmethod
+    def _cache_is_complete(cache, filters):
+        return bool(cache and cache.get('filter_signature')==signature(filters)
+                    and cache.get('status')=='ready'
+                    and int(cache.get('scanned_pages') or 0)>=int(cache.get('target_pages') or cache.get('scanned_pages') or 480))
+
+    async def latest_from_cache(self,uid,chat):
+        # New and 1/7/30-day collections are separate ordered VIEWS of one
+        # finalized snapshot, keyed by the persistent Settings signature.
+        await self.close_catalog(uid)
+        filters=await self.db.get_filters(uid,'latest')
+        cache=await self.db.get_collection_cache(uid)
+        if not self._cache_is_complete(cache,filters):
+            await self.ensure_collection(uid)
+            self.panel_kind[uid]='latest-wait'
+            old=getattr(self,'collection_wait_tasks',{}).get(uid)
+            if old and not old.done():old.cancel()
+            self.collection_wait_tasks[uid]=self.task(
+                self._collection_wait(uid,chat,30,signature(filters),as_latest=True))
+            return
+        ids=list(cache.get('candidate_ids') or [])
+        data=await self.db.listings_by_ids(ids)
+        hidden=set(await self.db.listing_ids(uid,'hidden'))
+        local=self._provider_filters(filters)
+        # Latest explicitly means listings CREATED in the past 30 days.
+        # Old sponsored ads remain searchable using one-off Search.
+        items=[x for x in data if str(x.get('id')) not in hidden
+               and age_days(x)<=30 and matches_local(x,local)]
+        shown=[str(x['id']) for x in sort_items(items,filters.get('sort','CREATED_AT'))]
+        if not shown:
+            self.panel_kind[uid]='latest-empty'
+            await self.panel(uid,chat,'<b>🆕 Новые · до 30 дней</b>\n\n'
+                'Нет подходящих объявлений по текущим настройкам.\n'
+                '<i>Откройте ⚙️ Настройки, чтобы изменить фильтры.</i>',
+                kb([[b('⚙️ Настройки','filter:latest')],[b('← Меню','go:home')]]))
+            return
+        c=Catalog(chat,uid,'latest','Новые · до 30 дней',filters,ids=shown,done=True)
+        self.catalogs[uid]=c
+        self.panel_kind[uid]='catalog'
+        log.info('New snapshot uid=%s count=%s first=%s signature=%s',
+                 uid,len(shown),shown[0],signature(filters)[:12])
+        await self._send_card(c,0,replace=False)
+
+    async def _collection_wait(self,uid,chat,days,sig,as_latest=False):
+        """Watch SQLite; open the finalized settings snapshot without HTTP in callbacks."""
         last=None
+        panel_state='latest-wait' if as_latest else f'collection-wait:{days}'
         try:
-            while self.panel_kind.get(uid)==f'collection-wait:{days}':
+            while self.panel_kind.get(uid)==panel_state:
                 cache=await self.db.get_collection_cache(uid)
-                if cache and cache['filter_signature']==sig:
-                    buckets=cache.get('buckets') or {}
-                    if str(days) in buckets and cache.get('status')=='ready':
-                        await self.collections_panel(uid,chat)
+                filters=await self.db.get_filters(uid,'latest')
+                # Never let an obsolete settings revision open a new catalog.
+                if signature(filters)!=sig:return
+                if self._cache_is_complete(cache,filters):
+                    if as_latest:
+                        await self.latest_from_cache(uid,chat)
+                    else:
                         await self.collection_from_cache(uid,chat,days)
-                        return
+                    return
+                if cache and cache['filter_signature']==sig:
                     pages=int(cache.get('scanned_pages') or 0)
                     candidates=int((cache.get('window_counts') or {}).get(str(days),cache.get('candidates') or 0))
                     if cache.get('status')=='error':
-                        text=('<b>🏆 Подборка · '+str(days)+' дней</b>\n\n'
-                              '⚠️ Не удалось завершить подготовку. Попробуйте открыть подборку позже.')
+                        text=(('<b>🆕 Новые</b>' if as_latest else f'<b>🏆 Подборка · {days} дней</b>')
+                              +'\n\n⚠️ Не удалось завершить подготовку. Повторите попытку позже.')
                         if text!=last:
-                            await self.panel(uid,chat,text,kb([[b('← Подборки','go:collections')]]))
+                            await self.panel(uid,chat,text,kb([[b('← Меню','go:home')]]))
                         return
                 else:
                     pages=candidates=0
-                text=(f'<b>🏆 Подборка · {days} дней</b>\n\n'
+                label='<b>🆕 Новые</b>' if as_latest else f'<b>🏆 Подборка · {days} дней</b>'
+                text=(f'{label}\n\n'
                       f'🔄 Формируется подборка · проверено {pages} из {COLLECTION_SCAN_PAGES} страниц'
-                      f' · подходящих кандидатов: {candidates}\n\n'
-                      '<i>Можно вернуться в меню — подготовка продолжится в фоне.</i>')
+                      f' · найдено за {days} дней: {candidates}\n\n'
+                      '<i>Подготовка выполняется один раз для текущих настроек.</i>')
                 if text!=last:
-                    await self.panel(uid,chat,text,kb([[b('← Подборки','go:collections')]]))
+                    await self.panel(uid,chat,text,kb([[b('← Меню','go:home')]]))
                     last=text
                 await asyncio.sleep(COLLECTION_WAIT_POLL_SECONDS)
         except asyncio.CancelledError:
             raise
-        except Exception:log.exception('collection wait UI failed')
+        except Exception:log.exception('collection/latest wait UI failed')
 
     async def collection_from_cache(self,uid,chat,days):
         """Never launches a provider scan from a Telegram callback."""
@@ -615,7 +690,7 @@ class Application:
         await self.close_catalog(uid)
         filters=await self.db.get_filters(uid,'latest')
         cache=await self.db.get_collection_cache(uid)
-        if (not cache or cache['filter_signature']!=signature(filters) or
+        if (not self._cache_is_complete(cache,filters) or
                 str(days) not in (cache.get('buckets') or {})):
             await self.ensure_collection(uid)
             self.panel_kind[uid]=f'collection-wait:{days}'
@@ -643,7 +718,7 @@ class Application:
         await self._send_card(c,0,replace=False)
 
     async def collection_maintenance(self):
-        """Resume interrupted builds and periodically refresh active profiles."""
+        """Resume interrupted builds; completed snapshots live until Settings change."""
         while True:
             try:
                 for uid in await self.db.active_collection_users(days=30,limit=200):
@@ -656,10 +731,13 @@ class Application:
             await asyncio.sleep(30*60)
 
     async def _load(self,c:Catalog):
-        """UI first: send the first matching card on the page that finds it.
+        # sponsor-aware-v4.0
+        """Sort the bounded initial scan *before* sending the first card.
 
-        Remaining pages continue in the same background worker. The progress
-        message exists ONLY while the catalog has no usable result.
+        A very selective local deposit filter can reject thousands of FREE
+        listings while one old paid ad matches on page one. Displaying that
+        provisional ad as the newest result is incorrect. Keep progress in
+        Telegram until the scan has a stable, locally filtered candidate set.
         """
         if c.done or c.load_lock.locked():return
         async with c.load_lock:
@@ -675,6 +753,9 @@ class Application:
                 hidden=set(await self.db.listing_ids(uid,'hidden'))
                 have=set(c.ids)
                 scanned=0
+                free_pages=0
+                # Do not release a search card until the initial prefix of
+                # the requested sort is scanned and locally sorted.
                 rare=bool(c.filters.get('deposit_max_months') is not None or
                           c.filters.get('advance_max_months') is not None or
                           c.filters.get('district_ids') or c.filters.get('location_text') or
@@ -683,25 +764,33 @@ class Application:
                 target=SEARCH_RARE_TARGET if rare else 480
                 # We can scan deeply, but never delay the first card to gather
                 # a target count. Every page can unlock a waiting Next press.
-                while gen==c.generation and scanned<page_budget and not c.done:
+                while gen==c.generation and free_pages<page_budget and scanned<page_budget+SEARCH_SPONSORED_ALLOWANCE and not c.done:
                     rows=await self._provider_page(c,c.next_page)
                     if gen!=c.generation:return
                     if not hasattr(self.db,'store_search_page'):
                         await self.db.put_listings(rows)
                     scanned+=1
+                    if getattr(c,'_page_has_regular',any(is_regular(item) for item in rows)):
+                        free_pages+=1
+                    previous_id=c.ids[c.index] if c.ids and c.index<len(c.ids) else None
                     for item in rows:
                         ident=str(item.get('id') or '')
                         if ident and ident not in hidden and ident not in have:
                             c.ids.append(ident);have.add(ident)
+                    if c.ids:
+                        # Provider puts EXCLUSIVE/PREMIUM/STANDARD before new FREE
+                        # regardless of selected sort. Correct order over scanned rows.
+                        items=await self.db.listings_by_ids(c.ids)
+                        c.ids=[str(x['id']) for x in sort_items(items,c.filters.get('sort','CREATED_AT'))]
+                        if previous_id in c.ids:
+                            c.index=c.ids.index(previous_id)
                     if c.ids and c.empty_message:
                         await self.safe_delete(c.chat_id,c.empty_message)
                         c.empty_message=None
-                    if c.ids and not c.message_id:
-                        # FIRST MATCH: show immediately, never after 8/48 pages.
-                        await self._send_card(c,0,replace=False)
-                        if progress:
-                            await self.safe_delete(c.chat_id,progress.message_id)
-                            progress=None;c.progress_message=None
+                    # Do not display a provisional sponsored/old card. The
+                    # filtering may be very selective (deposit <= 1 month):
+                    # the first eligible FREE entry can be on page 13 or later.
+                    # Keep progress visible until the bounded scan finishes.
                     if c.want_next and c.message_id and c.index+1<len(c.ids):
                         c.want_next=False
                         await self._send_card(c,c.index+1)
@@ -713,9 +802,17 @@ class Application:
                                 chat_id=c.chat_id,message_id=progress.message_id,
                                 parse_mode='HTML')
                         except TelegramBadRequest:pass
-                    if len(c.ids)>=target:break
+                    if free_pages and len(c.ids)>=target:break
                     if not c.done:await asyncio.sleep(.20)
                 if gen!=c.generation:return
+                if c.ids and not c.message_id:
+                    log.info('Search initial scan uid=%s pages=%s matched=%s first_id=%s first_created=%s',
+                             uid,c.scanned_pages,len(c.ids),c.ids[0],
+                             (await self.db.get_listing(c.ids[0]))[0].get('createdAt'))
+                    await self._send_card(c,0,replace=False)
+                    if progress:
+                        await self.safe_delete(c.chat_id,progress.message_id)
+                        progress=None;c.progress_message=None
                 if c.message_id and c.ids:
                     item,_=await self.db.get_listing(c.ids[c.index])
                     fav=await self.db.is_marked(uid,item['id'],'favorites')
@@ -764,9 +861,12 @@ class Application:
     async def launch(self,uid,chat,kind,filters=None):
         await self.close_catalog(uid)
         self.panel_kind[uid]='catalog'
-        if kind in ('search','latest'):
-            f=clean(filters if filters is not None else await self.db.get_filters(uid,kind))
-            c=Catalog(chat,uid,kind,'Новые' if kind=='latest' else 'Поиск',f)
+        if kind=='latest':
+            await self.latest_from_cache(uid,chat)
+            return
+        if kind=='search':
+            f=clean(filters if filters is not None else await self.db.get_filters(uid,'search'))
+            c=Catalog(chat,uid,kind,'Поиск',f)
             self.catalogs[uid]=c;c.worker=self.task(self._load(c));return
         if kind=='favorites':
             ids=await self.db.listing_ids(uid,'favorites')
@@ -939,6 +1039,9 @@ class Application:
             if not message.from_user:return
             uid=message.from_user.id;await self.db.user(message.from_user)
             await self.close_catalog(uid)
+            # /start must create a visible menu after Telegram chat history is cleared.
+            # Old panel message IDs may still be editable but invisible to the user.
+            self.panels.pop(uid,None)
             intent=parse_start(message.text or '')
             if intent:
                 route,listing_id=intent
@@ -968,7 +1071,10 @@ class Application:
         @r.message(Command('menu'))
         async def menu(message:Message):
             if not message.from_user:return
-            await self.db.user(message.from_user);await self.close_catalog(message.from_user.id);await self.home(message.from_user.id,message.chat.id)
+            await self.db.user(message.from_user)
+            await self.close_catalog(message.from_user.id)
+            self.panels.pop(message.from_user.id,None)
+            await self.home(message.from_user.id,message.chat.id)
             await self.safe_delete(message.chat.id,message.message_id)
 
         @r.callback_query(F.data.startswith('go:'))

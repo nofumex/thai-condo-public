@@ -1,0 +1,40 @@
+Manual channel posting failed
+Traceback (most recent call last):
+  File "C:\Users\egori\thai-condo-public\phbot\bot.py", line 203, in channel_manual_job
+    result=await publish_manual(self,count)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\egori\AppData\Local\Programs\Python\Python312\Lib\unittest\mock.py", line 2259, in _execute_mock_call
+    raise effect
+RuntimeError: API failed
+PropertyHub bad GraphQL Int at offset 660, size 60: retrying in chunks of 20
+PropertyHub bad GraphQL Int at offset 680, size 20: retrying in chunks of 10
+PropertyHub bad GraphQL Int at offset 690, size 10: retrying in chunks of 5
+PropertyHub bad GraphQL Int at offset 690, size 5: retrying in chunks of 1
+PropertyHub invalid listing at offset 690 (skipped): PropertyHub: Int cannot represent non 32-bit signed integer value: 3000000000
+======================================================================
+FAIL: test_manual_fifty_posts_skips_already_published_and_respects_sort (test_channel.ChannelCycleTests.test_manual_fifty_posts_skips_already_published_and_respects_sort)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\egori\AppData\Local\Programs\Python\Python312\Lib\unittest\async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\egori\AppData\Local\Programs\Python\Python312\Lib\unittest\async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\egori\AppData\Local\Programs\Python\Python312\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\egori\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 685, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\egori\AppData\Local\Programs\Python\Python312\Lib\unittest\mock.py", line 1404, in patched
+    return await func(*newargs, **newkeywargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\egori\thai-condo-public\tests\test_channel.py", line 189, in test_manual_fifty_posts_skips_already_published_and_respects_sort
+    self.assertEqual(result['already_posted'],0)
+AssertionError: 2 != 0
+
+----------------------------------------------------------------------
+Ran 80 tests in 10.711s
+
+FAILED (failures=1)

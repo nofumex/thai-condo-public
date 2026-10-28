@@ -16,11 +16,11 @@ COLLECTION_CACHE_HOURS = 6
 COLLECTION_SCAN_PAGES = 80
 COLLECTION_MAX_PAGES = 480
 COLLECTION_PAGE_BATCH = 80
-COLLECTION_TARGET = 100
+COLLECTION_TARGET = 10000
 
 
 def signature(filters: dict) -> str:
-    stable = json.dumps({'version': 4, 'filters': clean(filters)}, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    stable = json.dumps({'version': 5, 'sponsor_aware': True, 'filters': clean(filters)}, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(stable.encode('utf-8')).hexdigest()
 
 

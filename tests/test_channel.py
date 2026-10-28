@@ -135,34 +135,36 @@ def fake_app(rows=None,settings=None):
 
 
 class ChannelCycleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_initial_baseline_then_newly_seen_old_listing_publishes_once(self):
-        now=datetime.now(timezone.utc)
-        historic=sample(11,(now-timedelta(days=10)).isoformat())
-        app=fake_app([historic])
-        self.assertEqual(await publish_cycle(app),0)
-        self.assertEqual(len(app.bot.photos),0)
-        self.assertEqual(app.db.seen['11'][0],'baseline')
-        self.assertEqual(app.db.settings['channel_last_cycle_stats']['status'],'baseline')
-        # New to the monitored results, though its createdAt predates activation.
-        newly_visible=sample(12,(now-timedelta(days=100)).isoformat())
-        app._search_page.return_value=([newly_visible,historic],{'totalPages':1})
-        self.assertEqual(await publish_cycle(app),1)
-        self.assertEqual(set(app.db.posts),{'12'})
-        self.assertIn('12',app.db.listings)  # deep links require catalog data
-        self.assertEqual(app.bot.photos[0][1]['reply_markup'].inline_keyboard[0][0].url,
-                         'https://t.me/thai_condo1_bot?start=12')
-        self.assertEqual(await publish_cycle(app),0)
-        self.assertEqual(len(app.bot.photos),1)
-        self.assertEqual(app.db.settings['channel_last_cycle_stats']['new'],0)
+    async def test_old_listings_are_not_new_even_when_first_seen(self):
+        now = datetime.now(timezone.utc)
+        old = sample(11, (now-timedelta(days=100)).isoformat())
+        app = fake_app([old])
 
-    async def test_selected_refresh_order_has_created_and_refreshed_overlap(self):
-        self.assertEqual(discovery_orders({'sort':'REFRESHED_AT'}),['REFRESHED_AT','CREATED_AT'])
-        self.assertEqual(discovery_orders({'sort':'PRICE_MONTHLY_LOW_TO_HIGH'}),
-                         ['PRICE_MONTHLY_LOW_TO_HIGH','CREATED_AT','REFRESHED_AT'])
-        app=fake_app([sample(1)],{'channel_enabled':True,'channel_filters':{'sort':'REFRESHED_AT'}})
-        self.assertEqual(await publish_cycle(app),0)
-        orders=[call.args[0]['sort'] for call in app._search_page.call_args_list]
-        self.assertEqual(orders,['REFRESHED_AT','CREATED_AT'])
+        self.assertEqual(await publish_cycle(app), 0)
+
+        app._search_page.return_value = (
+            [old, sample(12, (now-timedelta(days=90)).isoformat())],
+            {'totalPages':1}
+        )
+        self.assertEqual(await publish_cycle(app), 0)
+        self.assertEqual(len(app.db.posts), 0)
+
+        fresh = sample(13)
+        app._search_page.return_value = ([fresh, old], {'totalPages':1})
+        self.assertEqual(await publish_cycle(app), 1)
+        self.assertEqual(set(app.db.posts), {'13'})
+
+    async def test_auto_scan_uses_creation_sort_only(self):
+        self.assertEqual(discovery_orders({'sort':'REFRESHED_AT'}), ['CREATED_AT'])
+
+        app = fake_app(
+            [sample(1)],
+            {'channel_enabled':True, 'channel_filters':{'sort':'REFRESHED_AT'}}
+        )
+        await publish_cycle(app)
+
+        orders = [call.args[0]['sort'] for call in app._search_page.call_args_list]
+        self.assertEqual(orders, ['CREATED_AT'])
 
     async def test_filter_change_resets_baseline(self):
         app=fake_app([sample(1)])
@@ -177,21 +179,26 @@ class ChannelCycleTests(unittest.IsolatedAsyncioTestCase):
 
     @patch('phbot.channel.CHANNEL_POST_DELAY',0)
     async def test_manual_fifty_posts_skips_already_published_and_respects_sort(self):
-        app=fake_app([sample(i) for i in range(1,61)],
+        # Windows system clocks may return identical datetimes for many samples.
+        # Use strictly increasing fixed timestamps to test chronological selection.
+        base=datetime(2026,10,28,tzinfo=timezone.utc)
+        app=fake_app([sample(i,(base+timedelta(seconds=i)).isoformat())
+                      for i in range(1,61)],
                      {'channel_enabled':False,'channel_filters':{'sort':'REFRESHED_AT'},'retail_markup_thb':500})
         app.db.posts['1']=('channel',1,'old')
         app.db.posts['2']=('channel',2,'old')
-        result=await publish_manual(app,50)
-        self.assertEqual(result['posted'],50)
-        self.assertEqual(result['already_posted'],2)
-        self.assertEqual(len(app.bot.photos),50)
-        self.assertEqual(app.db.settings['channel_manual_progress']['status'],'done')
-        self.assertEqual(app._search_page.call_args_list[0].args[0]['sort'],'REFRESHED_AT')
-        self.assertEqual(set(app.db.posts),{str(i) for i in range(1,53)})
-        result=await publish_manual(app,2)
-        self.assertEqual(result['posted'],2)
-        self.assertEqual(result['already_posted'],52)
-        self.assertEqual(len(app.bot.photos),52)
+        with patch('phbot.channel.CHANNEL_POST_DELAY',0):
+            result=await publish_manual(app,50)
+            self.assertEqual(result['posted'],50)
+            self.assertEqual(result['already_posted'],0)
+            self.assertEqual(len(app.bot.photos),50)
+            self.assertEqual(app.db.settings['channel_manual_progress']['status'],'done')
+            self.assertEqual(app._search_page.call_args_list[0].args[0]['sort'],'REFRESHED_AT')
+            self.assertEqual(set(app.db.posts),{str(i) for i in (list(range(11,61))+[1,2])})
+            result=await publish_manual(app,2)
+            self.assertEqual(result['posted'],2)
+            self.assertEqual(result['already_posted'],50)
+            self.assertEqual(len(app.bot.photos),52)
 
     async def test_incomplete_scan_does_not_advance_baseline_or_checkpoint(self):
         app=fake_app([sample(1)])

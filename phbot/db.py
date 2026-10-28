@@ -53,6 +53,13 @@ class Database:
         );
         CREATE INDEX IF NOT EXISTS idx_search_pages_fetched ON search_pages(fetched_at);
         CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS sponsored_inventory (
+          query_key TEXT NOT NULL, listing_id TEXT NOT NULL,
+          sponsor_package TEXT NOT NULL, listing_json TEXT NOT NULL,
+          observed_at TEXT NOT NULL,
+          PRIMARY KEY(query_key,listing_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sponsor_observed ON sponsored_inventory(query_key,observed_at);
         CREATE TABLE IF NOT EXISTS channel_posts (
           listing_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, message_id INTEGER NOT NULL,
           created_at TEXT NOT NULL, source_created_at TEXT
@@ -172,7 +179,7 @@ class Database:
             except (ValueError,TypeError):return True
         if cache['status'] in ('building','pending'):return True
         if not all(str(d) in cache['buckets'] for d in (1,7,30)):return True
-        return int(cache.get('scanned_pages') or 0)<int(cache.get('target_pages') or 480) or cache_expired(cache)
+        return int(cache.get('scanned_pages') or 0)<int(cache.get('target_pages') or 480)
 
     async def active_collection_users(self,days=30,limit=200):
         cutoff=(datetime.now(timezone.utc)-timedelta(days=days)).isoformat()
@@ -213,6 +220,11 @@ class Database:
                 WHERE user_id=? AND filter_signature=?''',(now,uid,sig))
         await self.conn.commit()
         return cursor.rowcount>0
+
+    async def set_collection_target_pages(self,uid,sig,pages):
+        await self.conn.execute('UPDATE collection_cache SET target_pages=? WHERE user_id=? AND filter_signature=?',
+                                (int(pages),uid,sig))
+        await self.conn.commit()
 
     async def collection_progress(self,uid,sig,pages,candidates,skipped,ids=None,window_counts=None):
         if ids is None:
@@ -273,9 +285,29 @@ class Database:
             return items,json.loads(row['meta_json'])
         except (ValueError,TypeError):return None
 
+    async def store_sponsored(self,query_key,items):
+        """Upsert paid listings returned for this exact upstream search profile.
+
+        Crucially, query_key includes all server filters (location/price/etc),
+        so later local filtering cannot accidentally import ads from a different
+        geographic or price search. The main listings table stores both tiers.
+        """
+        from .sponsor import is_paid
+        paid=[x for x in items if x.get('id') is not None and is_paid(x)]
+        if paid:
+            await self.conn.executemany("""INSERT INTO sponsored_inventory
+                (query_key,listing_id,sponsor_package,listing_json,observed_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(query_key,listing_id) DO UPDATE SET
+                sponsor_package=excluded.sponsor_package,
+                listing_json=excluded.listing_json,observed_at=excluded.observed_at""",
+                [(query_key,str(x['id']),str(x.get('sponsorPackage')),
+                  json.dumps(x,ensure_ascii=False,default=str),utc()) for x in paid])
+            await self.conn.commit()
+
     async def store_search_page(self,key,page,items,meta):
         # Listings are global and may be referenced by any user/profile.
         await self.put_listings(items)
+        await self.store_sponsored(key,items)
         await self.conn.execute('''INSERT INTO search_pages
             (query_key,page,ids_json,meta_json,fetched_at) VALUES(?,?,?,?,?)
             ON CONFLICT(query_key,page) DO UPDATE SET
@@ -286,6 +318,7 @@ class Database:
     async def prune_search_pages(self,max_age_hours=24):
         cutoff=(datetime.now(timezone.utc)-timedelta(hours=max_age_hours)).isoformat()
         await self.conn.execute('DELETE FROM search_pages WHERE fetched_at<?',(cutoff,))
+        await self.conn.execute('DELETE FROM sponsored_inventory WHERE observed_at<?',(cutoff,))
         await self.conn.commit()
 
     async def put_listings(self,items:list[dict]):
@@ -390,6 +423,13 @@ class Database:
     async def channel_ignore_pending(self):
         """An admin changing filters must not publish backlog from old filters."""
         await self.conn.execute("UPDATE channel_seen SET status='baseline' WHERE status='pending'")
+        await self.conn.commit()
+
+    async def channel_mark_baseline(self,ident):
+        await self.conn.execute(
+            "UPDATE channel_seen SET status='baseline' WHERE listing_id=? AND status='pending'",
+            (str(ident),)
+        )
         await self.conn.commit()
 
     async def channel_pending(self,limit):

@@ -26,12 +26,12 @@ def main_kb(admin=False):
           [b('📊 Рынок','go:market'),b('⚙️ Настройки','filter:latest')]]
     if admin:rows.append([b('🛠 Админка','go:admin')])
     return kb(rows)
-MAIN='<b>🏙 Thai Condo</b>\nПоиск аренды по объявлениям PropertyHub\n\n<em>Выберите раздел</em>'
+MAIN='<b>🏙 Thai Condo</b>\n\n<em>Выберите раздел</em>'
 
 def filter_summary(kind,f):
     heading={'search':'🔎 Разовый поиск','latest':'⚙️ Постоянные настройки','channel':'📢 Фильтры публикаций в канал'}.get(kind,'⚙️ Фильтры')
     explanation=('Эти фильтры не влияют на «Новые» и «Подборки».' if kind=='search' else
-                 'Эти фильтры применяются к «Новые» и «Подборки». Разовый поиск независим.' if kind=='latest' else
+                 'Эти фильтры применяются к «Новые» (до 30 дней) и «Подборки». Общая выборка пересобирается при изменении настроек. Разовый поиск независим.' if kind=='latest' else
                  'Только для автоматических публикаций в канале; другие разделы не изменяются.')
     return f'<b>{heading}</b>\n\n🎯 {esc(concise(f))}\n↕️ {esc(SORTS[f["sort"]])}\n\n<i>{explanation}</i>'
 

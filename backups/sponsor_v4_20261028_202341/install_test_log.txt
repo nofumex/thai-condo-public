@@ -1,0 +1,17 @@
+Manual channel posting failed
+Traceback (most recent call last):
+  File "C:\Users\egori\thai-condo-public\phbot\bot.py", line 203, in channel_manual_job
+    result=await publish_manual(self,count)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\egori\AppData\Local\Programs\Python\Python312\Lib\unittest\mock.py", line 2259, in _execute_mock_call
+    raise effect
+RuntimeError: API failed
+PropertyHub bad GraphQL Int at offset 660, size 60: retrying in chunks of 20
+PropertyHub bad GraphQL Int at offset 680, size 20: retrying in chunks of 10
+PropertyHub bad GraphQL Int at offset 690, size 10: retrying in chunks of 5
+PropertyHub bad GraphQL Int at offset 690, size 5: retrying in chunks of 1
+PropertyHub invalid listing at offset 690 (skipped): PropertyHub: Int cannot represent non 32-bit signed integer value: 3000000000
+----------------------------------------------------------------------
+Ran 80 tests in 11.000s
+
+OK

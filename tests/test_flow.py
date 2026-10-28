@@ -106,10 +106,9 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         work=asyncio.create_task(app._load(c))
         try:
             await asyncio.wait_for(page2_entered.wait(),2)
-            self.assertIsNotNone(c.message_id,'First listing must already be visible')
+            self.assertIsNone(c.message_id,'Do not show a premature result while still scanning')
             self.assertEqual(c.ids,['1'])
-            self.assertIn(c.progress_message,(None,))
-            self.assertIn(101,app.bot.deleted,'Loading message should be gone after first card')
+            self.assertIsNotNone(c.progress_message,'Show scan progress until best match is known')
         finally:
             release_page2.set()
             await work
